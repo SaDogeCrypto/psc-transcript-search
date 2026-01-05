@@ -1,0 +1,87 @@
+{
+  "timestamp": "2026-01-04T20:22:36.081326",
+  "pages_tested": [
+    {
+      "name": "CPUC Hearing 2025-01-23",
+      "url": "https://www.adminmonitor.com/ca/cpuc/hearing/20250123/",
+      "result": {
+        "accessible": true,
+        "status_code": 200,
+        "content_type": "text/html;charset=UTF-8",
+        "content_length": "26323"
+      }
+    },
+    {
+      "name": "CPUC Hearing 2024-10-22",
+      "url": "https://www.adminmonitor.com/ca/cpuc/hearing/20241022/",
+      "result": {
+        "accessible": true,
+        "status_code": 200,
+        "content_type": "text/html;charset=UTF-8",
+        "content_length": "25938"
+      }
+    },
+    {
+      "name": "CPUC Hearing 2023-11-20",
+      "url": "https://www.adminmonitor.com/ca/cpuc/hearing/20231120/",
+      "result": {
+        "accessible": true,
+        "status_code": 200,
+        "content_type": "text/html;charset=UTF-8",
+        "content_length": "25794"
+      }
+    },
+    {
+      "name": "TX PUCT Open Meeting",
+      "url": "https://www.adminmonitor.com/tx/puct/open_meeting/",
+      "result": {
+        "accessible": true,
+        "status_code": 200,
+        "content_type": "text/html;charset=UTF-8",
+        "content_length": "263659"
+      }
+    }
+  ],
+  "videos_found": [
+    {
+      "page": "CPUC Hearing 2025-01-23",
+      "url": "https://dj13yv2opnszq.cloudfront.net/videos/am_3114_Hearing_2025_01_23_auto1_1741170783_HPxSEd/master.m3u8",
+      "info": {
+        "accessible": true,
+        "is_master": true,
+        "line_count": 13,
+        "preview": "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=802359,RESOLUTION=480x270,CODECS=\"avc1.4d4015,mp4a.40.2\"\nstream_0/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=1022359,RESOLUTION=640x360,CODECS=\"avc1.4d401e,mp4a.40.2\"\nstream_1/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=1682359,RESOLUTION=854x480,CODECS=\"avc1.4d401f,mp4a.40.2\"\nstream_2/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=2892359,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\"\nstream_3/index.m3u8\n\n",
+        "variants": 4
+      }
+    },
+    {
+      "page": "CPUC Hearing 2024-10-22",
+      "url": "https://dj13yv2opnszq.cloudfront.net/videos/am_3066_Hearing_2024_10_22_auto1_1741162921_n7pvu5/master.m3u8",
+      "info": {
+        "accessible": true,
+        "is_master": true,
+        "line_count": 13,
+        "preview": "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=802646,RESOLUTION=480x270,CODECS=\"avc1.4d4015,mp4a.40.2\"\nstream_0/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=1022646,RESOLUTION=640x360,CODECS=\"avc1.4d401e,mp4a.40.2\"\nstream_1/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=1682646,RESOLUTION=854x480,CODECS=\"avc1.4d401f,mp4a.40.2\"\nstream_2/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=2892646,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\"\nstream_3/index.m3u8\n\n",
+        "variants": 4
+      }
+    },
+    {
+      "page": "CPUC Hearing 2023-11-20",
+      "url": "https://dj13yv2opnszq.cloudfront.net/videos/am_2855_Hearing_2023_11_20_auto1_1741084384_8BwOXQ/master.m3u8",
+      "info": {
+        "accessible": true,
+        "is_master": true,
+        "line_count": 13,
+        "preview": "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=801713,RESOLUTION=480x270,CODECS=\"avc1.4d4015,mp4a.40.2\"\nstream_0/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=1021713,RESOLUTION=640x360,CODECS=\"avc1.4d401e,mp4a.40.2\"\nstream_1/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=1681713,RESOLUTION=854x480,CODECS=\"avc1.4d401f,mp4a.40.2\"\nstream_2/index.m3u8\n\n#EXT-X-STREAM-INF:BANDWIDTH=2891713,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\"\nstream_3/index.m3u8\n\n",
+        "variants": 4
+      }
+    }
+  ],
+  "summary": {
+    "CPUC Hearings": 153,
+    "CPUC Voting Meetings": 237,
+    "CPUC Workshops": 102,
+    "TX PUCT Open Meetings": 264,
+    "TX PUCT Hearings": 41
+  }
+}
