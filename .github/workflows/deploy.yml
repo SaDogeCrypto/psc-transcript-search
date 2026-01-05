@@ -1,0 +1,27 @@
+name: Deploy to Azure
+
+  on:
+    push:
+      branches: [main]
+
+  jobs:
+    deploy:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: azure/docker-login@v1
+          with:
+            login-server: canaryscopeacr.azurecr.io
+            username: ${{ secrets.ACR_USERNAME }}
+            password: ${{ secrets.ACR_PASSWORD }}
+        - run: |
+            docker build -t canaryscopeacr.azurecr.io/dashboard:${{ github.sha }} customer-dashboard/
+            docker push canaryscopeacr.azurecr.io/dashboard:${{ github.sha }}
+        - uses: azure/login@v1
+          with:
+            creds: ${{ secrets.AZURE_CREDENTIALS }}
+        - run: |
+            az containerapp update \
+              --name canaryscope-dashboard-ca \
+              --resource-group canaryscope-rg \
+              --image canaryscopeacr.azurecr.io/dashboard:${{ github.sha }}
