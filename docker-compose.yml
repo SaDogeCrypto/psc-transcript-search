@@ -6,28 +6,43 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: psc_transcripts
+      POSTGRES_DB: canaryscope
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+      - ./migrations/002_dockets_tracking.sql:/docker-entrypoint-initdb.d/002_dockets_tracking.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   backend:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/psc_transcripts
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/canaryscope
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./customer-dashboard
+      dockerfile: Dockerfile
     ports:
-      - "8501:8501"
+      - "3000:3000"
     environment:
-      API_URL: http://backend:8000
+      NEXT_PUBLIC_API_URL: http://backend:8000
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/canaryscope
     depends_on:
       - backend
 

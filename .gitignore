@@ -9,15 +9,25 @@ env/
 .venv/
 ENV/
 
-# Data files (too large for git)
+# Data files
 data/audio/
 data/transcripts/
+data/*.db
 *.mp3
 *.wav
 
-# Keep database and insights for deployment
-!data/psc_transcripts.db
-!data/insights/
+# Extraction results (generated)
+*_results.json
+*_extraction*.json
+
+# Node.js
+node_modules/
+.next/
+.turbo/
+dist/
+
+# Prisma (generated at build)
+**/generated/prisma/
 
 # IDE
 .idea/
@@ -36,4 +46,3 @@ Thumbs.db
 
 # Logs
 *.log
-.env

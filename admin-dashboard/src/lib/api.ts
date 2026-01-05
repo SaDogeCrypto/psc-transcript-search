@@ -1,0 +1,247 @@
+/**
+ * API client for the PSC Transcript Search backend
+ */
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+export interface AdminStats {
+  total_states: number;
+  total_sources: number;
+  total_hearings: number;
+  total_segments: number;
+  total_hours: number;
+  hearings_by_status: Record<string, number>;
+  hearings_by_state: Record<string, number>;
+  total_transcription_cost: number;
+  total_analysis_cost: number;
+  total_cost: number;
+  hearings_last_24h: number;
+  hearings_last_7d: number;
+  sources_healthy: number;
+  sources_error: number;
+  pipeline_jobs_pending: number;
+  pipeline_jobs_running: number;
+  pipeline_jobs_error: number;
+  cost_today: number;
+  cost_this_week: number;
+  cost_this_month: number;
+}
+
+export interface Source {
+  id: number;
+  state_id: number;
+  state_code: string;
+  state_name: string;
+  name: string;
+  source_type: string;
+  url: string;
+  enabled: boolean;
+  check_frequency_hours: number;
+  last_checked_at: string | null;
+  last_hearing_at: string | null;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+}
+
+export interface State {
+  id: number;
+  code: string;
+  name: string;
+  commission_name: string | null;
+  hearing_count: number;
+}
+
+export interface SourceCreateData {
+  state_id: number;
+  name: string;
+  source_type: string;
+  url: string;
+  check_frequency_hours?: number;
+  enabled?: boolean;
+}
+
+export interface PipelineJob {
+  id: number;
+  hearing_id: number;
+  stage: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
+  retry_count: number;
+  cost_usd: number | null;
+}
+
+export interface Hearing {
+  id: number;
+  state_code: string;
+  state_name: string;
+  title: string;
+  hearing_date: string | null;
+  hearing_type: string | null;
+  utility_name: string | null;
+  duration_seconds: number | null;
+  status: string;
+  source_url: string | null;
+  created_at: string;
+  pipeline_status: string;
+  pipeline_jobs: PipelineJob[];
+}
+
+export interface PipelineRun {
+  id: number;
+  started_at: string;
+  completed_at: string | null;
+  status: string;
+  sources_checked: number;
+  new_hearings: number;
+  hearings_processed: number;
+  errors: number;
+  transcription_cost_usd: number;
+  analysis_cost_usd: number;
+  total_cost_usd: number;
+}
+
+async function fetchAPI<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_URL}${endpoint}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`API error: ${res.status} ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+// Admin Stats
+export async function getAdminStats(): Promise<AdminStats> {
+  return fetchAPI<AdminStats>('/admin/stats');
+}
+
+// States
+export async function getStates(): Promise<State[]> {
+  return fetchAPI<State[]>('/admin/states');
+}
+
+// Sources
+export async function getSources(state?: string, status?: string): Promise<Source[]> {
+  const params = new URLSearchParams();
+  if (state) params.set('state', state);
+  if (status) params.set('status', status);
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return fetchAPI<Source[]>(`/admin/sources${query}`);
+}
+
+export async function createSource(data: SourceCreateData): Promise<Source> {
+  return fetchAPI<Source>('/admin/sources', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteSource(sourceId: number): Promise<{ message: string }> {
+  return fetchAPI(`/admin/sources/${sourceId}`, { method: 'DELETE' });
+}
+
+export async function triggerSourceCheck(sourceId: number): Promise<{ message: string }> {
+  return fetchAPI(`/admin/sources/${sourceId}/check`, { method: 'POST' });
+}
+
+export async function toggleSource(sourceId: number): Promise<{ message: string; enabled: boolean }> {
+  return fetchAPI(`/admin/sources/${sourceId}/toggle`, { method: 'PATCH' });
+}
+
+// Hearings
+export async function getHearings(params?: {
+  states?: string;
+  status?: string;
+  pipeline_status?: string;
+  date_from?: string;
+  date_to?: string;
+  page?: number;
+  page_size?: number;
+}): Promise<Hearing[]> {
+  const searchParams = new URLSearchParams();
+  if (params?.states) searchParams.set('states', params.states);
+  if (params?.status) searchParams.set('status', params.status);
+  if (params?.pipeline_status) searchParams.set('pipeline_status', params.pipeline_status);
+  if (params?.date_from) searchParams.set('date_from', params.date_from);
+  if (params?.date_to) searchParams.set('date_to', params.date_to);
+  if (params?.page) searchParams.set('page', params.page.toString());
+  if (params?.page_size) searchParams.set('page_size', params.page_size.toString());
+  const query = searchParams.toString() ? `?${searchParams.toString()}` : '';
+  return fetchAPI<Hearing[]>(`/admin/hearings${query}`);
+}
+
+export async function retryHearing(hearingId: number, stage?: string): Promise<{ message: string }> {
+  const params = stage ? `?stage=${stage}` : '';
+  return fetchAPI(`/admin/hearings/${hearingId}/retry${params}`, { method: 'POST' });
+}
+
+export async function cancelHearing(hearingId: number): Promise<{ message: string }> {
+  return fetchAPI(`/admin/hearings/${hearingId}/cancel`, { method: 'POST' });
+}
+
+// Pipeline Runs
+export async function getPipelineRuns(limit: number = 30): Promise<PipelineRun[]> {
+  return fetchAPI<PipelineRun[]>(`/admin/runs?limit=${limit}`);
+}
+
+// Scraper Control
+export interface ScraperError {
+  timestamp: string;
+  source: string;
+  error: string;
+}
+
+export interface ScraperResults {
+  sources_scraped: number;
+  items_found: number;
+  new_hearings: number;
+  existing_hearings: number;
+  errors: number;
+}
+
+export interface ScraperProgress {
+  status: 'idle' | 'running' | 'stopping' | 'completed' | 'error';
+  started_at: string | null;
+  finished_at: string | null;
+  current_scraper_type: string | null;
+  current_source_name: string | null;
+  current_source_index: number;
+  total_sources: number;
+  sources_completed: number;
+  items_found: number;
+  new_hearings: number;
+  existing_hearings: number;
+  errors: ScraperError[];
+  error_count: number;
+  scraper_results: Record<string, ScraperResults>;
+}
+
+export async function getScraperStatus(): Promise<ScraperProgress> {
+  return fetchAPI<ScraperProgress>('/admin/scraper/status');
+}
+
+export async function startScraper(params?: {
+  scraper_types?: string;
+  state?: string;
+  dry_run?: boolean;
+}): Promise<{ message: string; status: string }> {
+  const searchParams = new URLSearchParams();
+  if (params?.scraper_types) searchParams.set('scraper_types', params.scraper_types);
+  if (params?.state) searchParams.set('state', params.state);
+  if (params?.dry_run) searchParams.set('dry_run', 'true');
+  const query = searchParams.toString() ? `?${searchParams.toString()}` : '';
+  return fetchAPI(`/admin/scraper/start${query}`, { method: 'POST' });
+}
+
+export async function stopScraper(): Promise<{ message: string; status: string }> {
+  return fetchAPI('/admin/scraper/stop', { method: 'POST' });
+}

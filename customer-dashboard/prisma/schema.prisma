@@ -1,0 +1,250 @@
+// CanaryScope Prisma Schema
+// Utility Regulatory Intelligence Platform
+
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector")]
+}
+
+// ============================================================================
+// Core Entities
+// ============================================================================
+
+model State {
+  id             Int       @id @default(autoincrement())
+  code           String    @unique @db.VarChar(2)
+  name           String    @db.VarChar(100)
+  commissionName String?   @map("commission_name") @db.VarChar(200)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  sources  Source[]
+  hearings Hearing[]
+  dockets  Docket[]
+
+  @@map("states")
+}
+
+model Source {
+  id                  Int       @id @default(autoincrement())
+  stateId             Int       @map("state_id")
+  name                String    @db.VarChar(200)
+  sourceType          String    @map("source_type") @db.VarChar(50)
+  url                 String
+  configJson          Json?     @default("{}") @map("config_json")
+  enabled             Boolean   @default(true)
+  checkFrequencyHours Int       @default(24) @map("check_frequency_hours")
+  lastCheckedAt       DateTime? @map("last_checked_at")
+  lastHearingAt       DateTime? @map("last_hearing_at")
+  status              String    @default("pending") @db.VarChar(20)
+  errorMessage        String?   @map("error_message")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  state    State     @relation(fields: [stateId], references: [id], onDelete: Cascade)
+  hearings Hearing[]
+
+  @@map("sources")
+}
+
+model Hearing {
+  id              Int       @id @default(autoincrement())
+  sourceId        Int?      @map("source_id")
+  stateId         Int       @map("state_id")
+  externalId      String?   @map("external_id") @db.VarChar(100)
+  title           String
+  description     String?
+  hearingDate     DateTime? @map("hearing_date") @db.Date
+  hearingType     String?   @map("hearing_type") @db.VarChar(100)
+  utilityName     String?   @map("utility_name") @db.VarChar(200)
+  docketNumbers   String[]  @map("docket_numbers")
+  sourceUrl       String?   @map("source_url")
+  videoUrl        String?   @map("video_url")
+  durationSeconds Int?      @map("duration_seconds")
+  status          String    @default("discovered") @db.VarChar(20)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  state          State           @relation(fields: [stateId], references: [id], onDelete: Cascade)
+  source         Source?         @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  pipelineJobs   PipelineJob[]
+  transcript     Transcript?
+  segments       Segment[]
+  analysis       Analysis?
+  hearingDockets HearingDocket[]
+
+  @@map("hearings")
+}
+
+model PipelineJob {
+  id           Int       @id @default(autoincrement())
+  hearingId    Int       @map("hearing_id")
+  stage        String    @db.VarChar(20)
+  status       String    @default("pending") @db.VarChar(20)
+  startedAt    DateTime? @map("started_at")
+  completedAt  DateTime? @map("completed_at")
+  errorMessage String?   @map("error_message")
+  retryCount   Int       @default(0) @map("retry_count")
+  costUsd      Decimal?  @map("cost_usd") @db.Decimal(10, 4)
+  metadataJson Json?     @default("{}") @map("metadata_json")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  hearing Hearing @relation(fields: [hearingId], references: [id], onDelete: Cascade)
+
+  @@map("pipeline_jobs")
+}
+
+model Transcript {
+  id        Int      @id @default(autoincrement())
+  hearingId Int      @unique @map("hearing_id")
+  fullText  String?  @map("full_text")
+  wordCount Int?     @map("word_count")
+  model     String?  @db.VarChar(50)
+  costUsd   Decimal? @map("cost_usd") @db.Decimal(10, 4)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  hearing  Hearing   @relation(fields: [hearingId], references: [id], onDelete: Cascade)
+  segments Segment[]
+
+  @@map("transcripts")
+}
+
+model Segment {
+  id           Int                          @id @default(autoincrement())
+  hearingId    Int                          @map("hearing_id")
+  transcriptId Int?                         @map("transcript_id")
+  segmentIndex Int                          @map("segment_index")
+  startTime    Float                        @map("start_time")
+  endTime      Float                        @map("end_time")
+  text         String
+  speaker      String?                      @db.VarChar(200)
+  speakerRole  String?                      @map("speaker_role") @db.VarChar(100)
+  embedding    Unsupported("vector(1536)")?
+  createdAt    DateTime                     @default(now()) @map("created_at")
+
+  hearing    Hearing     @relation(fields: [hearingId], references: [id], onDelete: Cascade)
+  transcript Transcript? @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+
+  @@map("segments")
+}
+
+model Analysis {
+  id                     Int      @id @default(autoincrement())
+  hearingId              Int      @unique @map("hearing_id")
+  summary                String?
+  oneSentenceSummary     String?  @map("one_sentence_summary")
+  hearingType            String?  @map("hearing_type") @db.VarChar(100)
+  utilityName            String?  @map("utility_name") @db.VarChar(200)
+  participantsJson       Json?    @map("participants_json")
+  issuesJson             Json?    @map("issues_json")
+  commitmentsJson        Json?    @map("commitments_json")
+  vulnerabilitiesJson    Json?    @map("vulnerabilities_json")
+  commissionerConcernsJson Json?  @map("commissioner_concerns_json")
+  commissionerMood       String?  @map("commissioner_mood") @db.VarChar(100)
+  publicComments         String?  @map("public_comments")
+  publicSentiment        String?  @map("public_sentiment") @db.VarChar(50)
+  likelyOutcome          String?  @map("likely_outcome")
+  outcomeConfidence      Float?   @map("outcome_confidence")
+  riskFactorsJson        Json?    @map("risk_factors_json")
+  actionItemsJson        Json?    @map("action_items_json")
+  quotesJson             Json?    @map("quotes_json")
+  model                  String?  @db.VarChar(50)
+  costUsd                Decimal? @map("cost_usd") @db.Decimal(10, 4)
+  confidenceScore        Float?   @map("confidence_score")
+  createdAt              DateTime @default(now()) @map("created_at")
+
+  hearing Hearing @relation(fields: [hearingId], references: [id], onDelete: Cascade)
+
+  @@map("analyses")
+}
+
+model PipelineRun {
+  id                 Int       @id @default(autoincrement())
+  startedAt          DateTime  @map("started_at")
+  completedAt        DateTime? @map("completed_at")
+  status             String    @default("running") @db.VarChar(20)
+  sourcesChecked     Int       @default(0) @map("sources_checked")
+  newHearings        Int       @default(0) @map("new_hearings")
+  hearingsProcessed  Int       @default(0) @map("hearings_processed")
+  errors             Int       @default(0)
+  transcriptionCostUsd Decimal? @default(0) @map("transcription_cost_usd") @db.Decimal(10, 4)
+  analysisCostUsd    Decimal?  @default(0) @map("analysis_cost_usd") @db.Decimal(10, 4)
+  totalCostUsd       Decimal?  @default(0) @map("total_cost_usd") @db.Decimal(10, 4)
+  detailsJson        Json?     @default("{}") @map("details_json")
+  createdAt          DateTime  @default(now()) @map("created_at")
+
+  @@map("pipeline_runs")
+}
+
+model AlertSubscription {
+  id         Int      @id @default(autoincrement())
+  email      String   @db.VarChar(255)
+  alertType  String   @map("alert_type") @db.VarChar(50)
+  configJson Json     @map("config_json")
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("alert_subscriptions")
+}
+
+// ============================================================================
+// Docket Tracking (Topic-centric)
+// ============================================================================
+
+model Docket {
+  id              Int       @id @default(autoincrement())
+  stateId         Int?      @map("state_id")
+  docketNumber    String    @map("docket_number") @db.VarChar(50)
+  normalizedId    String    @unique @map("normalized_id") @db.VarChar(60)
+  docketType      String?   @map("docket_type") @db.VarChar(50)
+  company         String?   @db.VarChar(255)
+  title           String?   @db.VarChar(500)
+  description     String?
+  currentSummary  String?   @map("current_summary")
+  status          String    @default("open") @db.VarChar(50)
+  decisionExpected DateTime? @map("decision_expected") @db.Date
+  firstSeenAt     DateTime  @default(now()) @map("first_seen_at")
+  lastMentionedAt DateTime? @map("last_mentioned_at")
+  mentionCount    Int       @default(1) @map("mention_count")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  state          State?          @relation(fields: [stateId], references: [id])
+  hearingDockets HearingDocket[]
+  watchlistItems UserWatchlist[]
+
+  @@map("dockets")
+}
+
+model HearingDocket {
+  hearingId      Int      @map("hearing_id")
+  docketId       Int      @map("docket_id")
+  mentionSummary String?  @map("mention_summary")
+  timestampsJson String?  @map("timestamps_json") // JSON array
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  hearing Hearing @relation(fields: [hearingId], references: [id], onDelete: Cascade)
+  docket  Docket  @relation(fields: [docketId], references: [id], onDelete: Cascade)
+
+  @@id([hearingId, docketId])
+  @@map("hearing_dockets")
+}
+
+model UserWatchlist {
+  userId          Int      @map("user_id")
+  docketId        Int      @map("docket_id")
+  notifyOnMention Boolean  @default(true) @map("notify_on_mention")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  docket Docket @relation(fields: [docketId], references: [id], onDelete: Cascade)
+
+  @@id([userId, docketId])
+  @@map("user_watchlist")
+}

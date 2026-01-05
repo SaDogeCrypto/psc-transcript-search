@@ -1,0 +1,30 @@
+# Production Docker Compose for Azure Container Apps
+# Uses Azure PostgreSQL Flexible Server (external)
+
+version: '3.8'
+
+services:
+  backend:
+    image: ${ACR_NAME}.azurecr.io/canaryscope-backend:${TAG:-latest}
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    image: ${ACR_NAME}.azurecr.io/canaryscope-frontend:${TAG:-latest}
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://backend:8000}
+      DATABASE_URL: ${DATABASE_URL}
+    restart: unless-stopped
+    depends_on:
+      - backend
