@@ -22,9 +22,12 @@ const handler = NextAuth({
         password: { label: "Password", type: "password" }
       },
       async authorize(credentials) {
+        if (!credentials?.email || !credentials?.password) {
+          return null
+        }
         // Admin auth
-        if (credentials?.email === process.env.ADMIN_EMAIL &&
-            credentials?.password === process.env.ADMIN_PASSWORD) {
+        if (credentials.email === process.env.ADMIN_EMAIL &&
+            credentials.password === process.env.ADMIN_PASSWORD) {
           return {
             id: "admin",
             email: credentials.email,
@@ -33,8 +36,8 @@ const handler = NextAuth({
           }
         }
         // Demo user auth
-        if (credentials?.email === process.env.DEMO_EMAIL &&
-            credentials?.password === process.env.DEMO_PASSWORD) {
+        if (credentials.email === process.env.DEMO_EMAIL &&
+            credentials.password === process.env.DEMO_PASSWORD) {
           return {
             id: "demo",
             email: credentials.email,
