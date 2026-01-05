@@ -66,4 +66,4 @@ jobs:
           az containerapp update \
             --name ${{ matrix.container_app }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
-            --image ${{ env.REGISTRY }}/${{ matrix.name }}:${{ github.sha }}
+            --image ${{ env.REGISTRY }}/${{ matrix.name }}:latest
