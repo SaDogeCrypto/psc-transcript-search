@@ -529,13 +529,20 @@ def get_admin_stats(db: Session = Depends(get_db)):
 # SCRAPER CONTROL
 # ============================================================================
 
-# Import orchestrator
-from scripts.scraper_orchestrator import get_orchestrator, ScraperStatus
+# Scraper endpoints are only available when the scraper module is installed
+# (not in the lightweight API-only deployment)
+try:
+    from scripts.scraper_orchestrator import get_orchestrator, ScraperStatus
+    SCRAPER_AVAILABLE = True
+except ImportError:
+    SCRAPER_AVAILABLE = False
 
 
 @router.get("/scraper/status")
 def get_scraper_status():
     """Get current scraper status and progress."""
+    if not SCRAPER_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Scraper module not available in this deployment")
     orchestrator = get_orchestrator()
     return orchestrator.get_progress()
 
@@ -555,6 +562,8 @@ def start_scraper(
 
     Returns immediately with status. Poll /admin/scraper/status for progress.
     """
+    if not SCRAPER_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Scraper module not available in this deployment")
     orchestrator = get_orchestrator()
 
     if orchestrator.is_running:
@@ -598,6 +607,8 @@ def stop_scraper():
 
     The scraper will finish processing the current source before stopping.
     """
+    if not SCRAPER_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Scraper module not available in this deployment")
     orchestrator = get_orchestrator()
 
     if not orchestrator.is_running:
@@ -630,6 +641,8 @@ def run_scraper_sync(
     Warning: This can take several minutes depending on the number of sources.
     For long-running scrapes, use /admin/scraper/start instead.
     """
+    if not SCRAPER_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Scraper module not available in this deployment")
     orchestrator = get_orchestrator()
 
     if orchestrator.is_running:
