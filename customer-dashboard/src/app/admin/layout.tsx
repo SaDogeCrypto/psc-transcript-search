@@ -2,16 +2,10 @@
 
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { useSession } from 'next-auth/react'
 import Link from 'next/link'
-import { supabase } from '@/lib/supabase'
 import { Shield, ArrowLeft } from 'lucide-react'
 import './admin.css'
-
-// Admin email whitelist - add admin emails here
-const ADMIN_EMAILS = [
-  'admin@canaryscope.com',
-  'ronan@canaryscope.com',
-]
 
 export default function AdminLayout({
   children,
@@ -19,51 +13,37 @@ export default function AdminLayout({
   children: React.ReactNode
 }) {
   const router = useRouter()
-  const [loading, setLoading] = useState(true)
-  const [isAdmin, setIsAdmin] = useState(false)
+  const { data: session, status } = useSession()
+  const [authorized, setAuthorized] = useState(false)
 
   useEffect(() => {
-    async function checkAdmin() {
-      const { data: { session } } = await supabase.auth.getSession()
+    if (status === 'loading') return
 
-      if (!session) {
-        router.push('/login?redirect=/admin')
-        return
-      }
-
-      const userEmail = session.user.email?.toLowerCase()
-      if (userEmail && ADMIN_EMAILS.includes(userEmail)) {
-        setIsAdmin(true)
-      } else {
-        // Not an admin - redirect to dashboard
-        router.push('/dashboard')
-        return
-      }
-
-      setLoading(false)
+    if (status === 'unauthenticated') {
+      router.push('/login?callbackUrl=/admin')
+      return
     }
 
-    checkAdmin()
+    // Check if user has admin role
+    const role = (session?.user as any)?.role
+    if (role === 'admin') {
+      setAuthorized(true)
+    } else {
+      // Not an admin - redirect to dashboard
+      router.push('/dashboard')
+    }
+  }, [status, session, router])
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_OUT') {
-        router.push('/login')
-      }
-    })
-
-    return () => subscription.unsubscribe()
-  }, [router])
-
-  if (loading) {
+  if (status === 'loading') {
     return (
       <div className="admin-loading">
         <div className="spinner" />
-        <p>Verifying admin access...</p>
+        <p>Loading...</p>
       </div>
     )
   }
 
-  if (!isAdmin) {
+  if (!authorized) {
     return (
       <div className="admin-denied">
         <Shield className="h-12 w-12 text-red-500" />

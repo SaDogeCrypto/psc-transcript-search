@@ -1,34 +1,45 @@
 'use client'
 
 import { useState } from 'react'
+import { signIn } from 'next-auth/react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { Zap, Mail, Lock, ArrowRight, AlertCircle } from 'lucide-react'
-import { supabase } from '@/lib/supabase'
 
 export default function LoginPage() {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const callbackUrl = searchParams.get('callbackUrl') || '/dashboard'
+  const error = searchParams.get('error')
+
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [loginError, setLoginError] = useState<string | null>(
+    error === 'CredentialsSignin' ? 'Invalid email or password' : null
+  )
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault()
     setLoading(true)
-    setError(null)
+    setLoginError(null)
 
     try {
-      const { error } = await supabase.auth.signInWithPassword({
+      const result = await signIn('credentials', {
         email,
         password,
+        redirect: false,
+        callbackUrl,
       })
 
-      if (error) throw error
-
-      router.push('/dashboard')
+      if (result?.error) {
+        setLoginError('Invalid email or password')
+      } else if (result?.ok) {
+        router.push(callbackUrl)
+        router.refresh()
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to sign in')
+      setLoginError('An error occurred. Please try again.')
     } finally {
       setLoading(false)
     }
@@ -48,10 +59,10 @@ export default function LoginPage() {
             <p className="text-gray-600 mt-2">Sign in to your account to continue</p>
           </div>
 
-          {error && (
+          {loginError && (
             <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-3">
               <AlertCircle className="h-5 w-5 text-red-600 flex-shrink-0 mt-0.5" />
-              <p className="text-sm text-red-700">{error}</p>
+              <p className="text-sm text-red-700">{loginError}</p>
             </div>
           )}
 
@@ -97,9 +108,6 @@ export default function LoginPage() {
                 <input type="checkbox" className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
                 <span className="ml-2 text-sm text-gray-600">Remember me</span>
               </label>
-              <a href="#" className="text-sm text-blue-600 hover:underline">
-                Forgot password?
-              </a>
             </div>
 
             <button
@@ -115,7 +123,7 @@ export default function LoginPage() {
           <p className="text-center mt-8 text-gray-600">
             Don't have an account?{' '}
             <Link href="/signup" className="text-blue-600 font-medium hover:underline">
-              Start free trial
+              Contact us
             </Link>
           </p>
         </div>

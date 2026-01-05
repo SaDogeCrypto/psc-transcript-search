@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { useSession } from 'next-auth/react'
 import {
   Bell,
   Mail,
@@ -9,22 +10,20 @@ import {
   Check,
   AlertCircle,
 } from 'lucide-react'
-import { supabase, getUserPreferences, updateUserPreferences, type UserPreferences } from '@/lib/supabase'
 import { getStates, type State } from '@/lib/api'
 
 export default function SettingsPage() {
+  const { data: session } = useSession()
   const [states, setStates] = useState<State[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // User preferences
+  // User preferences (stored in localStorage for MVP)
   const [followedStates, setFollowedStates] = useState<string[]>([])
   const [alertFrequency, setAlertFrequency] = useState<'daily' | 'weekly' | 'off'>('daily')
   const [emailAlerts, setEmailAlerts] = useState(true)
-
-  const [user, setUser] = useState<any>(null)
 
   useEffect(() => {
     async function loadData() {
@@ -33,18 +32,13 @@ export default function SettingsPage() {
         const statesData = await getStates()
         setStates(statesData)
 
-        // Get current user
-        const { data: { user } } = await supabase.auth.getUser()
-        setUser(user)
-
-        if (user) {
-          // Load user preferences
-          const prefs = await getUserPreferences(user.id)
-          if (prefs) {
-            setFollowedStates(prefs.followed_states || [])
-            setAlertFrequency(prefs.alert_frequency || 'daily')
-            setEmailAlerts(prefs.email_alerts ?? true)
-          }
+        // Load preferences from localStorage
+        const savedPrefs = localStorage.getItem('userPreferences')
+        if (savedPrefs) {
+          const prefs = JSON.parse(savedPrefs)
+          setFollowedStates(prefs.followed_states || ['GA', 'FL', 'TX'])
+          setAlertFrequency(prefs.alert_frequency || 'daily')
+          setEmailAlerts(prefs.email_alerts ?? true)
         } else {
           // Demo defaults
           setFollowedStates(['GA', 'FL', 'TX'])
@@ -67,22 +61,17 @@ export default function SettingsPage() {
   }
 
   const handleSave = async () => {
-    if (!user) {
-      // Demo mode - just show success
-      setSaved(true)
-      setTimeout(() => setSaved(false), 2000)
-      return
-    }
-
     setSaving(true)
     setError(null)
 
     try {
-      await updateUserPreferences(user.id, {
+      // Save to localStorage for MVP
+      const prefs = {
         followed_states: followedStates,
         alert_frequency: alertFrequency,
         email_alerts: emailAlerts,
-      })
+      }
+      localStorage.setItem('userPreferences', JSON.stringify(prefs))
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     } catch (err) {
@@ -222,23 +211,23 @@ export default function SettingsPage() {
         </div>
       </div>
 
-      {/* Account Info (if logged in) */}
-      {user && (
+      {/* Account Info */}
+      {session?.user && (
         <div className="bg-white rounded-xl border border-gray-200 p-6">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">Account</h2>
           <div className="space-y-3 text-sm">
             <div className="flex justify-between py-2 border-b border-gray-100">
               <span className="text-gray-500">Email</span>
-              <span className="text-gray-900">{user.email}</span>
+              <span className="text-gray-900">{session.user.email}</span>
             </div>
             <div className="flex justify-between py-2 border-b border-gray-100">
               <span className="text-gray-500">Name</span>
-              <span className="text-gray-900">{user.user_metadata?.name || '-'}</span>
+              <span className="text-gray-900">{session.user.name || '-'}</span>
             </div>
             <div className="flex justify-between py-2">
-              <span className="text-gray-500">Plan</span>
+              <span className="text-gray-500">Role</span>
               <span className="px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-medium">
-                Trial
+                {(session.user as any).role === 'admin' ? 'Admin' : 'User'}
               </span>
             </div>
           </div>

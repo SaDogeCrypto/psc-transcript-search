@@ -1,8 +1,9 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
+import { useSession, signOut } from 'next-auth/react'
 import {
   Zap,
   Home,
@@ -15,8 +16,8 @@ import {
   Bell,
   ChevronDown,
   User,
+  Shield,
 } from 'lucide-react'
-import { supabase } from '@/lib/supabase'
 
 const NAV_ITEMS = [
   { href: '/dashboard', label: 'Home', icon: Home },
@@ -32,35 +33,29 @@ export default function DashboardLayout({
 }) {
   const pathname = usePathname()
   const router = useRouter()
+  const { data: session, status } = useSession()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
-  const [user, setUser] = useState<any>(null)
 
-  useEffect(() => {
-    // Check auth status
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!session) {
-        // For demo, don't redirect - allow viewing without auth
-        // router.push('/login')
-      } else {
-        setUser(session.user)
-      }
-    })
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_OUT') {
-        router.push('/login')
-      } else if (session) {
-        setUser(session.user)
-      }
-    })
-
-    return () => subscription.unsubscribe()
-  }, [router])
+  const isAdmin = (session?.user as any)?.role === 'admin'
 
   const handleSignOut = async () => {
-    await supabase.auth.signOut()
-    router.push('/')
+    await signOut({ callbackUrl: '/login' })
+  }
+
+  // Show loading state
+  if (status === 'loading') {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="animate-spin h-8 w-8 border-4 border-blue-600 border-t-transparent rounded-full" />
+      </div>
+    )
+  }
+
+  // Redirect if not authenticated
+  if (status === 'unauthenticated') {
+    router.push('/login')
+    return null
   }
 
   return (
@@ -113,6 +108,21 @@ export default function DashboardLayout({
               </Link>
             )
           })}
+
+          {/* Admin link */}
+          {isAdmin && (
+            <Link
+              href="/admin"
+              className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                pathname.startsWith('/admin')
+                  ? 'bg-purple-50 text-purple-700'
+                  : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+              }`}
+            >
+              <Shield className="h-5 w-5" />
+              <span className="font-medium">Admin</span>
+            </Link>
+          )}
         </nav>
 
         <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-gray-200">
@@ -122,10 +132,10 @@ export default function DashboardLayout({
             </div>
             <div className="flex-1 min-w-0">
               <div className="text-sm font-medium text-gray-900 truncate">
-                {user?.user_metadata?.name || 'Demo User'}
+                {session?.user?.name || 'User'}
               </div>
               <div className="text-xs text-gray-500 truncate">
-                {user?.email || 'demo@canaryscope.com'}
+                {session?.user?.email || ''}
               </div>
             </div>
           </div>
@@ -175,6 +185,15 @@ export default function DashboardLayout({
                       >
                         Settings
                       </Link>
+                      {isAdmin && (
+                        <Link
+                          href="/admin"
+                          className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+                          onClick={() => setUserMenuOpen(false)}
+                        >
+                          Admin Panel
+                        </Link>
+                      )}
                       <button
                         onClick={handleSignOut}
                         className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
