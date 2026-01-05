@@ -20,10 +20,12 @@ COPY . .
 RUN npx prisma generate
 
 # Build the application with production API URL
+# CACHE_BUST arg ensures fresh build when API URL changes
+ARG CACHE_BUST=1
 ARG NEXT_PUBLIC_API_URL=https://canaryscope-api.redgrass-a228f3e3.canadacentral.azurecontainerapps.io
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_TELEMETRY_DISABLED 1
-RUN npm run build
+RUN echo "Building with API URL: $NEXT_PUBLIC_API_URL (cache bust: $CACHE_BUST)" && npm run build
 
 # Stage 3: Runner
 FROM node:20-alpine AS runner
