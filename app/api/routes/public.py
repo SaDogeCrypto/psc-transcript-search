@@ -32,21 +32,24 @@ router = APIRouter(prefix="/api", tags=["public"])
 @router.get("/states", response_model=List[StateResponse])
 def list_states(db: Session = Depends(get_db)):
     """Get all states with hearing counts."""
-    results = db.query(
-        State,
-        func.count(Hearing.id).label("hearing_count")
-    ).outerjoin(Hearing).group_by(State.id).order_by(State.name).all()
+    try:
+        results = db.query(
+            State,
+            func.count(Hearing.id).label("hearing_count")
+        ).outerjoin(Hearing).group_by(State.id).order_by(State.name).all()
 
-    return [
-        StateResponse(
-            id=r.State.id,
-            code=r.State.code,
-            name=r.State.name,
-            commission_name=r.State.commission_name,
-            hearing_count=r.hearing_count
-        )
-        for r in results
-    ]
+        return [
+            StateResponse(
+                id=r.State.id,
+                code=r.State.code,
+                name=r.State.name,
+                commission_name=r.State.commission_name,
+                hearing_count=r.hearing_count
+            )
+            for r in results
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @router.get("/states/{state_code}", response_model=StateResponse)
