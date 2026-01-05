@@ -6,15 +6,22 @@ on:
 
 env:
   REGISTRY: canaryscopeacr.azurecr.io
-  IMAGE_NAME: dashboard
   RESOURCE_GROUP: canaryscope-rg
-  CONTAINER_APP: canaryscope-dashboard-ca
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    outputs:
-      image-tag: ${{ steps.meta.outputs.tags }}
+    strategy:
+      matrix:
+        include:
+          - name: api
+            context: .
+            dockerfile: Dockerfile
+            container_app: canaryscope-api
+          - name: dashboard
+            context: customer-dashboard
+            dockerfile: Dockerfile
+            container_app: canaryscope-dashboard-ca
     steps:
       - uses: actions/checkout@v4
 
@@ -32,35 +39,31 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ matrix.name }}
           tags: |
             type=sha,prefix=
             type=raw,value=latest
 
-      - name: Build and push
+      - name: Build and push ${{ matrix.name }}
         uses: docker/build-push-action@v6
         with:
-          context: customer-dashboard
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # Use inline cache for ACR layer caching
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
           build-args: |
             BUILDKIT_INLINE_CACHE=1
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy to Container App
+      - name: Deploy ${{ matrix.name }} to Container App
         run: |
           az containerapp update \
-            --name ${{ env.CONTAINER_APP }} \
+            --name ${{ matrix.container_app }} \
             --resource-group ${{ env.RESOURCE_GROUP }} \
-            --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            --image ${{ env.REGISTRY }}/${{ matrix.name }}:${{ github.sha }}
