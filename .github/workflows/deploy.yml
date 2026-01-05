@@ -16,7 +16,7 @@ jobs:
         include:
           - name: api
             context: .
-            dockerfile: Dockerfile
+            dockerfile: Dockerfile.api
             container_app: canaryscope-api
           - name: dashboard
             context: customer-dashboard
