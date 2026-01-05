@@ -2,11 +2,26 @@
 Streamlit frontend for PSC Transcript Search.
 """
 
-import os
+import json
+import sqlite3
 import streamlit as st
-import requests
+from pathlib import Path
 
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+# Database path
+DB_PATH = Path(__file__).parent.parent / "data" / "psc_transcripts.db"
+INSIGHTS_DIR = Path(__file__).parent.parent / "data" / "insights"
+
+
+def get_db():
+    """Get database connection."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def dict_from_row(row):
+    """Convert sqlite3.Row to dict."""
+    return {key: row[key] for key in row.keys()} if row else None
 
 st.set_page_config(
     page_title="PSC Transcript Search",
@@ -69,62 +84,74 @@ with tab1:
     if query:
         with st.spinner("Searching..."):
             try:
+                conn = get_db()
+                cursor = conn.cursor()
+
                 if search_type == "Full-text":
-                    response = requests.get(
-                        f"{API_URL}/api/search",
-                        params={"q": query, "limit": 50},
-                        timeout=30
-                    )
+                    # FTS5 search
+                    cursor.execute("""
+                        SELECT s.id as segment_id, s.hearing_id, h.youtube_id,
+                               h.title as hearing_title, s.start_time, s.end_time,
+                               s.text, s.speaker, s.speaker_role
+                        FROM segments s
+                        JOIN hearings h ON s.hearing_id = h.id
+                        JOIN segments_fts fts ON s.id = fts.rowid
+                        WHERE segments_fts MATCH ?
+                        ORDER BY rank
+                        LIMIT 50
+                    """, (query,))
                 else:
-                    response = requests.get(
-                        f"{API_URL}/api/search/semantic",
-                        params={"q": query, "limit": 50},
-                        timeout=30
-                    )
+                    # Fallback to LIKE search
+                    cursor.execute("""
+                        SELECT s.id as segment_id, s.hearing_id, h.youtube_id,
+                               h.title as hearing_title, s.start_time, s.end_time,
+                               s.text, s.speaker, s.speaker_role
+                        FROM segments s
+                        JOIN hearings h ON s.hearing_id = h.id
+                        WHERE s.text LIKE ?
+                        ORDER BY s.start_time
+                        LIMIT 50
+                    """, (f"%{query}%",))
 
-                if response.status_code == 200:
-                    data = response.json()
-                    results = data["results"]
+                results = [dict_from_row(row) for row in cursor.fetchall()]
+                conn.close()
 
-                    st.markdown(f"**Found {len(results)} results for:** _{query}_")
-                    st.divider()
+                st.markdown(f"**Found {len(results)} results for:** _{query}_")
+                st.divider()
 
-                    for result in results:
-                        with st.container():
-                            col1, col2 = st.columns([4, 1])
+                for result in results:
+                    with st.container():
+                        col1, col2 = st.columns([4, 1])
 
-                            with col1:
-                                # Speaker badge
-                                speaker_info = ""
-                                if result.get("speaker"):
-                                    speaker_info = f"**{result['speaker']}**"
-                                elif result.get("speaker_role"):
-                                    speaker_info = f"_{result['speaker_role']}_"
+                        with col1:
+                            speaker_info = ""
+                            if result.get("speaker"):
+                                speaker_info = f"**{result['speaker']}**"
+                            elif result.get("speaker_role"):
+                                speaker_info = f"_{result['speaker_role']}_"
 
-                                if speaker_info:
-                                    st.markdown(speaker_info)
+                            if speaker_info:
+                                st.markdown(speaker_info)
 
-                                st.markdown(f'"{result["text"]}"')
-                                st.caption(f"From: {result['hearing_title']}")
+                            st.markdown(f'"{result["text"]}"')
+                            st.caption(f"From: {result['hearing_title']}")
 
-                            with col2:
-                                # Timestamp and link
-                                minutes = int(result["start_time"] // 60)
-                                seconds = int(result["start_time"] % 60)
-                                timestamp = f"{minutes}:{seconds:02d}"
+                        with col2:
+                            minutes = int(result["start_time"] // 60)
+                            seconds = int(result["start_time"] % 60)
+                            timestamp = f"{minutes}:{seconds:02d}"
+                            youtube_id = result["youtube_id"]
+                            start_sec = int(result["start_time"])
 
-                                st.markdown(f"**{timestamp}**")
-                                st.link_button(
-                                    "Watch",
-                                    result["youtube_timestamp_url"],
-                                    use_container_width=True
-                                )
+                            st.markdown(f"**{timestamp}**")
+                            st.link_button(
+                                "Watch",
+                                f"https://www.youtube.com/watch?v={youtube_id}&t={start_sec}s",
+                                use_container_width=True
+                            )
 
-                            st.divider()
-                else:
-                    st.error(f"Search failed with status {response.status_code}")
-            except requests.exceptions.ConnectionError:
-                st.error("Could not connect to the API. Make sure the backend is running.")
+                        st.divider()
+
             except Exception as e:
                 st.error(f"Search failed: {str(e)}")
 
@@ -135,20 +162,37 @@ with tab2:
     if "selected_hearing" in st.session_state and st.session_state.selected_hearing:
         hearing_id = st.session_state.selected_hearing
 
-        # Back button
         if st.button("< Back to Hearings List"):
             st.session_state.selected_hearing = None
             st.rerun()
 
         try:
+            conn = get_db()
+            cursor = conn.cursor()
+
             # Get hearing info
-            hearing_resp = requests.get(f"{API_URL}/api/hearings/{hearing_id}", timeout=10)
-            segments_resp = requests.get(f"{API_URL}/api/hearings/{hearing_id}/segments?limit=500", timeout=30)
+            cursor.execute("""
+                SELECT h.*, COUNT(s.id) as segment_count
+                FROM hearings h
+                LEFT JOIN segments s ON h.id = s.hearing_id
+                WHERE h.id = ?
+                GROUP BY h.id
+            """, (hearing_id,))
+            hearing = dict_from_row(cursor.fetchone())
 
-            if hearing_resp.status_code == 200 and segments_resp.status_code == 200:
-                hearing = hearing_resp.json()["hearing"]
-                segments = segments_resp.json()["segments"]
+            # Get segments
+            cursor.execute("""
+                SELECT s.*, h.youtube_id
+                FROM segments s
+                JOIN hearings h ON s.hearing_id = h.id
+                WHERE s.hearing_id = ?
+                ORDER BY s.start_time
+                LIMIT 500
+            """, (hearing_id,))
+            segments = [dict_from_row(row) for row in cursor.fetchall()]
+            conn.close()
 
+            if hearing:
                 st.subheader(hearing["title"])
 
                 col1, col2 = st.columns([3, 1])
@@ -161,7 +205,6 @@ with tab2:
 
                 st.divider()
 
-                # Display transcript segments
                 for seg in segments:
                     minutes = int(seg["start_time"] // 60)
                     seconds = int(seg["start_time"] % 60)
@@ -179,48 +222,52 @@ with tab2:
                         start_sec = int(seg["start_time"])
                         st.markdown(f"[Play](https://www.youtube.com/watch?v={youtube_id}&t={start_sec}s)")
             else:
-                st.error("Could not load transcript")
+                st.error("Hearing not found")
         except Exception as e:
             st.error(f"Error loading transcript: {str(e)}")
     else:
         # Show hearings list
         try:
-            response = requests.get(f"{API_URL}/api/hearings", timeout=10)
-            if response.status_code == 200:
-                hearings = response.json()["hearings"]
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT h.*, COUNT(s.id) as segment_count
+                FROM hearings h
+                LEFT JOIN segments s ON h.id = s.hearing_id
+                GROUP BY h.id
+                ORDER BY h.created_at DESC
+            """)
+            hearings = [dict_from_row(row) for row in cursor.fetchall()]
+            conn.close()
 
-                if not hearings:
-                    st.info("No hearings have been indexed yet. Run the data pipeline scripts to add content.")
-                else:
-                    for hearing in hearings:
-                        with st.expander(f"{hearing['title']} ({hearing.get('segment_count', 0)} segments)"):
-                            col1, col2 = st.columns([3, 1])
-
-                            with col1:
-                                if hearing.get("hearing_date"):
-                                    st.write(f"**Date:** {hearing['hearing_date']}")
-                                if hearing.get("duration_seconds"):
-                                    duration_min = hearing["duration_seconds"] // 60
-                                    st.write(f"**Duration:** {duration_min} minutes")
-                                if hearing.get("description"):
-                                    st.write(f"**Description:** {hearing['description'][:200]}...")
-
-                            with col2:
-                                st.link_button(
-                                    "Watch on YouTube",
-                                    hearing.get("youtube_url", "#"),
-                                    use_container_width=True
-                                )
-
-                                if hearing.get("segment_count", 0) > 0:
-                                    if st.button("View Transcript", key=f"transcript_{hearing['id']}"):
-                                        st.session_state.selected_hearing = hearing["id"]
-                                        st.rerun()
-
+            if not hearings:
+                st.info("No hearings have been indexed yet. Run the data pipeline scripts to add content.")
             else:
-                st.error("Could not load hearings")
-        except requests.exceptions.ConnectionError:
-            st.warning("Could not connect to the API. Make sure the backend is running on port 8000.")
+                for hearing in hearings:
+                    with st.expander(f"{hearing['title']} ({hearing.get('segment_count', 0)} segments)"):
+                        col1, col2 = st.columns([3, 1])
+
+                        with col1:
+                            if hearing.get("hearing_date"):
+                                st.write(f"**Date:** {hearing['hearing_date']}")
+                            if hearing.get("duration_seconds"):
+                                duration_min = hearing["duration_seconds"] // 60
+                                st.write(f"**Duration:** {duration_min} minutes")
+                            if hearing.get("description"):
+                                st.write(f"**Description:** {hearing['description'][:200]}...")
+
+                        with col2:
+                            st.link_button(
+                                "Watch on YouTube",
+                                hearing.get("youtube_url", "#"),
+                                use_container_width=True
+                            )
+
+                            if hearing.get("segment_count", 0) > 0:
+                                if st.button("View Transcript", key=f"transcript_{hearing['id']}"):
+                                    st.session_state.selected_hearing = hearing["id"]
+                                    st.rerun()
+
         except Exception as e:
             st.error(f"Error loading hearings: {str(e)}")
 
@@ -237,11 +284,14 @@ with tab3:
             st.rerun()
 
         try:
-            # Get full insights
-            resp = requests.get(f"{API_URL}/api/insights/{hearing_id}", timeout=10)
+            # Load insights from file
+            insight_file = INSIGHTS_DIR / f"{hearing_id}_insights.json"
+            if not insight_file.exists():
+                insight_file = INSIGHTS_DIR / f"{hearing_id}.json"
 
-            if resp.status_code == 200:
-                data = resp.json()
+            if insight_file.exists():
+                with open(insight_file) as f:
+                    data = json.load(f)
                 hi = data.get("hearing_insights", {})
 
                 # Header with confidence score
@@ -357,52 +407,55 @@ with tab3:
                 else:
                     st.write("No notable segments flagged")
 
-            elif resp.status_code == 404:
-                st.warning(f"No insights found for hearing {hearing_id}")
             else:
-                st.error(f"Error loading insights: {resp.status_code}")
+                st.warning(f"No insights found for hearing {hearing_id}")
 
-        except requests.exceptions.ConnectionError:
-            st.error("Could not connect to the API")
         except Exception as e:
             st.error(f"Error: {str(e)}")
 
     else:
         # List all available insights
         try:
-            response = requests.get(f"{API_URL}/api/insights", timeout=10)
+            insights = []
+            if INSIGHTS_DIR.exists():
+                for file in INSIGHTS_DIR.glob("*_insights.json"):
+                    try:
+                        with open(file) as f:
+                            data = json.load(f)
+                        hi = data.get("hearing_insights", {})
+                        insights.append({
+                            "hearing_id": data.get("hearing_id", file.stem.replace("_insights", "")),
+                            "one_sentence_summary": hi.get("one_sentence_summary", ""),
+                            "commissioner_mood": hi.get("commissioner_mood", ""),
+                            "confidence_score": hi.get("confidence_score", 0),
+                            "notable_segments": sum(1 for s in data.get("segment_insights", []) if s.get("is_notable"))
+                        })
+                    except:
+                        continue
 
-            if response.status_code == 200:
-                data = response.json()
-                insights = data.get("insights", [])
-
-                if not insights:
-                    st.info("No AI insights have been generated yet. Run the insight extraction script on your transcripts.")
-                else:
-                    st.write(f"**{len(insights)} hearings analyzed**")
-
-                    for insight in insights:
-                        with st.expander(f"{insight.get('hearing_id', 'Unknown')} - {insight.get('notable_segments', 0)} notable segments"):
-                            st.write(insight.get("one_sentence_summary", "No summary"))
-
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                confidence = insight.get("confidence_score", 0)
-                                st.metric("Confidence", f"{confidence:.0%}")
-                            with col2:
-                                st.metric("Notable Segments", insight.get("notable_segments", 0))
-                            with col3:
-                                mood = insight.get("commissioner_mood", "Unknown")
-                                st.write(f"**Mood:** {mood[:30]}...")
-
-                            if st.button("View Full Analysis", key=f"insight_{insight.get('hearing_id')}"):
-                                st.session_state.selected_insight = insight.get("hearing_id")
-                                st.rerun()
+            if not insights:
+                st.info("No AI insights have been generated yet. Run the insight extraction script on your transcripts.")
             else:
-                st.error("Could not load insights")
+                st.write(f"**{len(insights)} hearings analyzed**")
 
-        except requests.exceptions.ConnectionError:
-            st.warning("Could not connect to the API. Make sure the backend is running.")
+                for insight in insights:
+                    with st.expander(f"{insight.get('hearing_id', 'Unknown')} - {insight.get('notable_segments', 0)} notable segments"):
+                        st.write(insight.get("one_sentence_summary", "No summary"))
+
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            confidence = insight.get("confidence_score", 0)
+                            st.metric("Confidence", f"{confidence:.0%}")
+                        with col2:
+                            st.metric("Notable Segments", insight.get("notable_segments", 0))
+                        with col3:
+                            mood = insight.get("commissioner_mood", "Unknown")
+                            st.write(f"**Mood:** {mood[:30]}..." if mood else "Unknown")
+
+                        if st.button("View Full Analysis", key=f"insight_{insight.get('hearing_id')}"):
+                            st.session_state.selected_insight = insight.get("hearing_id")
+                            st.rerun()
+
         except Exception as e:
             st.error(f"Error: {str(e)}")
 
@@ -410,24 +463,31 @@ with tab4:
     st.header("Database Statistics")
 
     try:
-        response = requests.get(f"{API_URL}/api/stats", timeout=10)
-        if response.status_code == 200:
-            stats = response.json()
+        conn = get_db()
+        cursor = conn.cursor()
 
-            col1, col2, col3 = st.columns(3)
+        cursor.execute("SELECT COUNT(*) as count FROM hearings")
+        hearing_count = cursor.fetchone()["count"]
 
-            with col1:
-                st.metric("Total Hearings", stats.get("hearings", 0))
+        cursor.execute("SELECT COUNT(*) as count FROM segments")
+        segment_count = cursor.fetchone()["count"]
 
-            with col2:
-                st.metric("Total Segments", stats.get("segments", 0))
+        cursor.execute("SELECT COALESCE(SUM(duration_seconds), 0) as total FROM hearings")
+        total_duration = cursor.fetchone()["total"]
+        conn.close()
 
-            with col3:
-                st.metric("Total Hours", f"{stats.get('total_hours', 0):.1f}")
-        else:
-            st.warning("Could not load statistics")
-    except requests.exceptions.ConnectionError:
-        st.info("Statistics will appear once the backend is running and data is loaded.")
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("Total Hearings", hearing_count)
+
+        with col2:
+            st.metric("Total Segments", segment_count)
+
+        with col3:
+            total_hours = round(total_duration / 3600, 1) if total_duration else 0
+            st.metric("Total Hours", f"{total_hours}")
+
     except Exception as e:
         st.error(f"Error loading statistics: {str(e)}")
 
@@ -468,12 +528,16 @@ with st.sidebar:
 
     st.divider()
 
-    st.header("API Status")
+    st.header("Database Status")
     try:
-        response = requests.get(f"{API_URL}/", timeout=5)
-        if response.status_code == 200:
-            st.success("Backend: Connected")
+        if DB_PATH.exists():
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM hearings")
+            count = cursor.fetchone()["count"]
+            conn.close()
+            st.success(f"Database: {count} hearings")
         else:
-            st.error("Backend: Error")
-    except:
-        st.error("Backend: Not connected")
+            st.warning("Database: Not found")
+    except Exception as e:
+        st.error(f"Database: Error - {str(e)}")
