@@ -1,0 +1,48 @@
+# Large directories - MUST EXCLUDE
+venv
+data
+*.db
+*.sqlite
+
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+.mypy_cache/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build directories
+build/
+dist/
+node_modules/
+
+# Other apps (not needed for API)
+customer-dashboard/
+admin-dashboard/
+migrations/
+
+# Logs and temp files
+*.log
+*.tmp
+.DS_Store

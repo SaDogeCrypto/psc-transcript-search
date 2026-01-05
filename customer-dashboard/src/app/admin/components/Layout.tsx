@@ -27,7 +27,9 @@ export function Tabs({ active }: { active: string }) {
     { id: 'overview', label: 'Overview', href: '/admin' },
     { id: 'sources', label: 'Sources', href: '/admin/sources' },
     { id: 'hearings', label: 'Hearings', href: '/admin/hearings' },
-    { id: 'runs', label: 'Pipeline Runs', href: '/admin/runs' },
+    { id: 'runs', label: 'Scraper Runs', href: '/admin/runs' },
+    { id: 'pipeline', label: 'Pipeline', href: '/admin/pipeline' },
+    { id: 'schedules', label: 'Schedules', href: '/admin/schedules' },
   ];
 
   return (

@@ -73,6 +73,9 @@ class Hearing(Base):
     video_url = Column(Text)
     duration_seconds = Column(Integer)
     status = Column(String(20), default="discovered")
+    # Pipeline tracking
+    processing_started_at = Column(DateTime)
+    processing_cost_usd = Column(Numeric(10, 4), default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -259,3 +262,41 @@ class UserWatchlist(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     docket = relationship("Docket")
+
+
+class PipelineSchedule(Base):
+    """Database-backed schedule for automated pipeline/scraper runs."""
+    __tablename__ = "pipeline_schedules"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    schedule_type = Column(String(20), nullable=False)  # 'interval', 'daily', 'cron'
+    schedule_value = Column(String(100), nullable=False)  # '30m', '08:00', '0 */4 * * *'
+    target = Column(String(50), nullable=False)  # 'scraper', 'pipeline', 'all'
+    enabled = Column(Boolean, default=True)
+    config_json = Column(JSON, default={})  # {states: [], max_cost: 50, only_stage: null}
+    last_run_at = Column(DateTime)
+    next_run_at = Column(DateTime)
+    last_run_status = Column(String(20))  # 'success', 'error'
+    last_run_error = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PipelineState(Base):
+    """Singleton table tracking current orchestrator state."""
+    __tablename__ = "pipeline_state"
+
+    id = Column(Integer, primary_key=True)  # Always 1 (singleton)
+    status = Column(String(20), default="idle")  # 'idle', 'running', 'paused', 'stopping'
+    started_at = Column(DateTime)
+    current_hearing_id = Column(Integer, ForeignKey("hearings.id"))
+    current_stage = Column(String(30))
+    hearings_processed = Column(Integer, default=0)
+    errors_count = Column(Integer, default=0)
+    total_cost_usd = Column(Numeric(10, 4), default=0)
+    last_error = Column(Text)
+    config_json = Column(JSON, default={})  # {states: [], max_cost: 50, only_stage: null}
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    current_hearing = relationship("Hearing")

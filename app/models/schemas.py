@@ -378,3 +378,117 @@ class TimelineItem(BaseModel):
 
 class DocketWithTimeline(DocketDetail):
     timeline: List[TimelineItem] = []
+
+
+# ============================================================================
+# PIPELINE ORCHESTRATOR SCHEMAS
+# ============================================================================
+
+class PipelineStatusResponse(BaseModel):
+    """Current pipeline orchestrator status."""
+    status: str  # 'idle', 'running', 'paused', 'stopping'
+    started_at: Optional[datetime] = None
+    current_hearing_id: Optional[int] = None
+    current_hearing_title: Optional[str] = None
+    current_stage: Optional[str] = None
+    hearings_processed: int = 0
+    errors_count: int = 0
+    total_cost_usd: float = 0
+
+    # Stage counts for visualization
+    stage_counts: dict = {}  # {'discovered': 45, 'transcribing': 1, 'complete': 120, ...}
+
+    # Today's stats
+    processed_today: int = 0
+    cost_today: float = 0
+    errors_today: int = 0
+
+
+class PipelineStartRequest(BaseModel):
+    """Request to start the pipeline."""
+    states: Optional[List[str]] = None  # State codes to filter
+    max_cost: Optional[float] = 50.0  # Max cost for this run
+    only_stage: Optional[str] = None  # 'download', 'transcribe', 'analyze', 'extract'
+    max_hearings: Optional[int] = None  # Max hearings to process
+
+
+class PipelineActivityItem(BaseModel):
+    """A single pipeline activity entry."""
+    id: int
+    hearing_id: int
+    hearing_title: str
+    state_code: Optional[str] = None
+    stage: str
+    status: str
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    cost_usd: Optional[float] = None
+    error_message: Optional[str] = None
+
+
+class PipelineActivityResponse(BaseModel):
+    """Recent pipeline activity."""
+    items: List[PipelineActivityItem]
+    total_count: int
+
+
+class PipelineErrorItem(BaseModel):
+    """A hearing in error/failed state."""
+    hearing_id: int
+    hearing_title: str
+    state_code: Optional[str] = None
+    status: str
+    last_stage: Optional[str] = None
+    error_message: Optional[str] = None
+    retry_count: int = 0
+    updated_at: Optional[datetime] = None
+
+
+class PipelineErrorsResponse(BaseModel):
+    """Hearings in error/failed state."""
+    items: List[PipelineErrorItem]
+    total_count: int
+
+
+# ============================================================================
+# SCHEDULE SCHEMAS
+# ============================================================================
+
+class ScheduleResponse(BaseModel):
+    """Pipeline/scraper schedule."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    schedule_type: str  # 'interval', 'daily', 'cron'
+    schedule_value: str  # '30m', '08:00', '0 */4 * * *'
+    schedule_display: Optional[str] = None  # Human-readable: 'Every 30 minutes'
+    target: str  # 'scraper', 'pipeline', 'all'
+    enabled: bool
+    config_json: Optional[dict] = None
+    last_run_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+    last_run_status: Optional[str] = None
+    last_run_error: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ScheduleCreateRequest(BaseModel):
+    """Create a new schedule."""
+    name: str
+    schedule_type: str  # 'interval', 'daily', 'cron'
+    schedule_value: str  # '30m', '2h', '08:00', '0 */4 * * *'
+    target: str = "pipeline"  # 'scraper', 'pipeline', 'all'
+    enabled: bool = True
+    config: Optional[dict] = None  # {states: [], max_cost: 50, only_stage: null}
+
+
+class ScheduleUpdateRequest(BaseModel):
+    """Update an existing schedule."""
+    name: Optional[str] = None
+    schedule_type: Optional[str] = None
+    schedule_value: Optional[str] = None
+    target: Optional[str] = None
+    enabled: Optional[bool] = None
+    config: Optional[dict] = None

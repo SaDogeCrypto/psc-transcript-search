@@ -245,3 +245,170 @@ export async function startScraper(params?: {
 export async function stopScraper(): Promise<{ message: string; status: string }> {
   return fetchAPI('/admin/scraper/stop', { method: 'POST' });
 }
+
+// =============================================================================
+// PIPELINE ORCHESTRATOR
+// =============================================================================
+
+export interface PipelineStatus {
+  status: string;
+  started_at: string | null;
+  current_hearing_id: number | null;
+  current_hearing_title: string | null;
+  current_stage: string | null;
+  hearings_processed: number;
+  errors_count: number;
+  total_cost_usd: number;
+  stage_counts: Record<string, number>;
+  processed_today: number;
+  cost_today: number;
+  errors_today: number;
+}
+
+export interface PipelineStartRequest {
+  states?: string[];
+  only_stage?: string;
+  max_cost?: number;
+  max_hearings?: number;
+}
+
+export interface PipelineActivityItem {
+  id: number;
+  hearing_id: number;
+  hearing_title: string;
+  state_code: string | null;
+  stage: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  cost_usd: number | null;
+  error_message: string | null;
+}
+
+export interface PipelineErrorItem {
+  hearing_id: number;
+  hearing_title: string;
+  state_code: string | null;
+  status: string;
+  last_stage: string | null;
+  error_message: string | null;
+  retry_count: number;
+  updated_at: string | null;
+}
+
+export interface Schedule {
+  id: number;
+  name: string;
+  schedule_type: string;
+  schedule_value: string;
+  schedule_display: string | null;
+  target: string;
+  enabled: boolean;
+  config_json: Record<string, unknown>;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  last_run_status: string | null;
+  last_run_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScheduleCreateRequest {
+  name: string;
+  schedule_type: string;
+  schedule_value: string;
+  target: string;
+  enabled?: boolean;
+  config?: Record<string, unknown>;
+}
+
+export interface ScheduleUpdateRequest {
+  name?: string;
+  schedule_type?: string;
+  schedule_value?: string;
+  target?: string;
+  enabled?: boolean;
+  config?: Record<string, unknown>;
+}
+
+// Pipeline Status & Control
+export async function getPipelineStatus(): Promise<PipelineStatus> {
+  return fetchAPI<PipelineStatus>('/admin/pipeline/status');
+}
+
+export async function startPipeline(request?: PipelineStartRequest): Promise<{ message: string; config: Record<string, unknown> }> {
+  return fetchAPI('/admin/pipeline/start', {
+    method: 'POST',
+    body: JSON.stringify(request || {}),
+  });
+}
+
+export async function stopPipeline(): Promise<{ message: string }> {
+  return fetchAPI('/admin/pipeline/stop', { method: 'POST' });
+}
+
+export async function pausePipeline(): Promise<{ message: string }> {
+  return fetchAPI('/admin/pipeline/pause', { method: 'POST' });
+}
+
+export async function resumePipeline(): Promise<{ message: string }> {
+  return fetchAPI('/admin/pipeline/resume', { method: 'POST' });
+}
+
+// Pipeline Activity & Errors
+export async function getPipelineActivity(limit?: number, stage?: string): Promise<{ items: PipelineActivityItem[]; total_count: number }> {
+  const params = new URLSearchParams();
+  if (limit) params.set('limit', limit.toString());
+  if (stage) params.set('stage', stage);
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return fetchAPI(`/admin/pipeline/activity${query}`);
+}
+
+export async function getPipelineErrors(limit?: number): Promise<{ items: PipelineErrorItem[]; total_count: number }> {
+  const params = limit ? `?limit=${limit}` : '';
+  return fetchAPI(`/admin/pipeline/errors${params}`);
+}
+
+export async function retryPipelineHearing(hearingId: number, fromStage?: string): Promise<{ message: string }> {
+  const params = fromStage ? `?from_stage=${fromStage}` : '';
+  return fetchAPI(`/admin/pipeline/hearings/${hearingId}/retry${params}`, { method: 'POST' });
+}
+
+export async function skipPipelineHearing(hearingId: number): Promise<{ message: string }> {
+  return fetchAPI(`/admin/pipeline/hearings/${hearingId}/skip`, { method: 'POST' });
+}
+
+export async function retryAllPipelineErrors(): Promise<{ message: string }> {
+  return fetchAPI('/admin/pipeline/retry-all', { method: 'POST' });
+}
+
+// Schedules
+export async function getSchedules(): Promise<Schedule[]> {
+  return fetchAPI<Schedule[]>('/admin/pipeline/schedules');
+}
+
+export async function createSchedule(data: ScheduleCreateRequest): Promise<Schedule> {
+  return fetchAPI<Schedule>('/admin/pipeline/schedules', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateSchedule(scheduleId: number, data: ScheduleUpdateRequest): Promise<Schedule> {
+  return fetchAPI<Schedule>(`/admin/pipeline/schedules/${scheduleId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteSchedule(scheduleId: number): Promise<{ message: string }> {
+  return fetchAPI(`/admin/pipeline/schedules/${scheduleId}`, { method: 'DELETE' });
+}
+
+export async function toggleSchedule(scheduleId: number): Promise<{ enabled: boolean; next_run_at: string | null }> {
+  return fetchAPI(`/admin/pipeline/schedules/${scheduleId}/toggle`, { method: 'POST' });
+}
+
+export async function runScheduleNow(scheduleId: number): Promise<{ message: string }> {
+  return fetchAPI(`/admin/pipeline/schedules/${scheduleId}/run-now`, { method: 'POST' });
+}

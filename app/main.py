@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.database import engine, SessionLocal
-from app.api.routes import admin, public
+from app.api.routes import admin, public, pipeline
 from app.middleware.rate_limit import RateLimitMiddleware
 
 
@@ -78,6 +78,7 @@ app.add_middleware(RateLimitMiddleware, requests_per_minute=rate_limit)
 # Include routers
 app.include_router(public.router)
 app.include_router(admin.router)
+app.include_router(pipeline.router)
 
 
 @app.get("/")
