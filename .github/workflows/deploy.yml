@@ -1,27 +1,66 @@
-  name: Deploy to Azure
+name: Deploy to Azure
 
-  on:
-    push:
-      branches: [main]
+on:
+  push:
+    branches: [main]
 
-  jobs:
-    deploy:
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v4
-        - uses: azure/docker-login@v1
-          with:
-            login-server: canaryscopeacr.azurecr.io
-            username: ${{ secrets.ACR_USERNAME }}
-            password: ${{ secrets.ACR_PASSWORD }}
-        - run: |
-            docker build -t canaryscopeacr.azurecr.io/dashboard:${{ github.sha }} customer-dashboard/
-            docker push canaryscopeacr.azurecr.io/dashboard:${{ github.sha }}
-        - uses: azure/login@v1
-          with:
-            creds: ${{ secrets.AZURE_CREDENTIALS }}
-        - run: |
-            az containerapp update \
-              --name canaryscope-dashboard-ca \
-              --resource-group canaryscope-rg \
-              --image canaryscopeacr.azurecr.io/dashboard:${{ github.sha }}
+env:
+  REGISTRY: canaryscopeacr.azurecr.io
+  IMAGE_NAME: dashboard
+  RESOURCE_GROUP: canaryscope-rg
+  CONTAINER_APP: canaryscope-dashboard-ca
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: customer-dashboard
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Use inline cache for ACR layer caching
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Container App
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
