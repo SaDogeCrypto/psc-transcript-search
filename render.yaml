@@ -8,6 +8,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: SKIP_SAMPLE_DATA
+        value: "true"
 
   # Frontend (Streamlit)
   - type: web
@@ -19,7 +21,4 @@ services:
       - key: PYTHON_VERSION
         value: "3.11"
       - key: API_URL
-        fromService:
-          name: psc-transcript-api
-          type: web
-          property: hostport
+        sync: false  # Set manually after API deploys
