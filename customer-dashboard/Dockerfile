@@ -19,7 +19,9 @@ COPY . .
 # Generate Prisma client
 RUN npx prisma generate
 
-# Build the application
+# Build the application with production API URL
+ARG NEXT_PUBLIC_API_URL=https://canaryscope-api.redgrass-a228f3e3.canadacentral.azurecontainerapps.io
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_TELEMETRY_DISABLED 1
 RUN npm run build
 
