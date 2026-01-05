@@ -91,6 +91,18 @@ def root():
     }
 
 
+@app.get("/debug")
+def debug_info():
+    """Debug endpoint to check configuration."""
+    import os
+    from app.database import DATABASE_URL
+    return {
+        "database_url_set": bool(os.getenv("DATABASE_URL")),
+        "database_url_prefix": DATABASE_URL[:30] + "..." if len(DATABASE_URL) > 30 else DATABASE_URL,
+        "is_postgresql": DATABASE_URL.startswith("postgresql")
+    }
+
+
 @app.get("/health")
 def health_check():
     """Health check endpoint for load balancers."""
