@@ -364,6 +364,7 @@ EXCLUDE_KEYWORDS = [
     # Entertainment
     "music", "song", "concert", "entertainment",
     "trailer", "preview", "promo",
+
     # Educational/promotional content
     "meet your", "who we are", "how the puc works",
     "cold weather rule", "proteccion contra",
@@ -371,18 +372,142 @@ EXCLUDE_KEYWORDS = [
     "be utility wise", "callutilitiesnow",
     "what is energy choice", "how to handle a",
     "need telephone assistance", "what's up (and down)",
+    "what does the puc do", "what does the utc do",
+    "what is an irp", "what is dc power connect",
+    "overview of the public service commission",
+    "how the district of columbia gets",
+    "we work for you",
+
     # Training videos
     "professor max powers", "break out room",
     "fusion joints", "phmsa", "plastic pipe",
     "utility damage prevention", "vent limited regulator",
+
     # Non-utility topics
     "towing task force", "towing industry",
+
+    # 911/Emergency services (not utility regulation)
+    "911 enterprise board", "911 task force",
+    "esinet", "ipcs task force", "gis informational",
+    "9-1-1 leadership",
+
+    # Podcasts
+    "behind the meter: an mpsc podcast",
+
+    # Promotional ads and PSAs
+    "#winterreadydc", "#here2helpdc",
+    "call the commission", "consumer help line",
+    "clean energy program",
+    "utility bill assistance", "utility assistance day",
+    "energy choice 30 spot",
+    "small & diverse business", "small and diverse business",
+
+    # Safety campaigns
+    "safe digging month", "fix a leak week",
+    "rail safety week", "think train",
+    "fighting utility scams", "fight utility scams",
+
+    # Supplier training
+    "energy choice ohio supplier training",
+    "motor carrier registration",
+    "electronic log device (eld) training",
+
+    # Reconnect order PSAs
+    "special reconnect order", "winter reconnect order",
+
+    # Tutorials and how-tos
+    "how to make your voice heard",
+    "how to read and understand your",
+    "tutorial: how to",
+    "using interactive maps", "use puco docketing",
+    "navigating a cpuc docket",
+    "how to subscribe to case",
+    "making an electronic filing",
+    "prequalification and basic navigation",
+    "application map and application process",
+
+    # History/overview promos
+    "history behind the public utilities",
+    "behind the scenes with public utilities",
+
+    # Events and celebrations
+    "black history month",
+    "25th anniversary", "30 year anniversary",
+    "pride flag raising",
+    "swearing in ceremony",
+    "careers in utilities",
+
+    # Conferences (not hearings)
+    "cybersecurity conference",
+    "tri annual safety conference",
+    "clean energy summit",
+    "supplier diversity hearing",
+
+    # Press/staff conferences
+    "press conference", "press briefing",
+    "staff conference",
+    "lihwap press conference",
+
+    # Bill education
+    "understand your electric bill",
+    "managing rising energy costs",
+
+    # Grant programs
+    "formula grant program",
+
+    # Rate case educational series
+    "revenue requirement: what is",
+    "parties in a rate case",
+    "review of storm costs in a rate case",
+    "review of utility depreciation",
+    "take back our grid act",
+    "ways to get involved in a rate case",
+    "allowed rate of return",
+    "overview of rate cases",
+
+    # Other educational
+    "african american leaders who shaped",
+    "distribution integrity management",
+    "kidwind challenge", "k-12 energy benchmarking",
+    "gas pipeline safety: filing",
+    "request a speaker",
+    "what happens when i contact",
+    "understanding energy choice",
+    "energy assistance program",
+    "home energy assistance",
+    "annual report overview",
+    "annual report webinar",
+    "pura parking & building",
+
+    # PowerPath/DC promotional
+    "powerpath dc", "community renewable energy facilities",
+
+    # Program announcements
+    "program announcement", "check presentation",
+    "informational session",
+
+    # Vigilant Guard
+    "vigilant guard",
+
+    # Transportation recruiting
+    "transportation enforcement recruiting",
+
+    # Time of use promos
+    "xcel energy's new time of use",
+
+    # Bill relief announcements
+    "delivered $430 million",
+
     # Conference panels (not hearings)
     "a glimpse of the future",
+
     # Broadband (different regulatory domain)
     "bead challenge", "bead rebuttal", "bead program",
+
     # Generic non-hearing content
     "opening remarks", "closing remarks",
+    "winter storm tips", "consumer education video",
+    "holiday driving tips",
 ]
 
 
