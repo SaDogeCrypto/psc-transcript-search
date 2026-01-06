@@ -8,7 +8,9 @@ import os
 import subprocess
 import tempfile
 import logging
+import json
 from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -51,6 +53,9 @@ class DownloadStage(BaseStage):
     def execute(self, hearing: Hearing, db: Session) -> StageResult:
         """Download audio from video URL."""
         audio_path = self._get_audio_path(hearing)
+
+        # Fetch and update video metadata (upload date, duration) if missing
+        self._update_video_metadata(hearing, db)
 
         # Skip if already downloaded
         if audio_path.exists():
@@ -95,6 +100,58 @@ class DownloadStage(BaseStage):
                 should_retry=True
             )
 
+    def _update_video_metadata(self, hearing: Hearing, db: Session):
+        """Fetch and update video metadata (upload date, duration) from source."""
+        # Only fetch if we're missing the hearing_date
+        if hearing.hearing_date and hearing.duration_seconds:
+            return
+
+        logger.info(f"Fetching metadata for hearing {hearing.id}")
+
+        try:
+            # Use yt-dlp to get video metadata
+            cmd = [
+                "yt-dlp",
+                "--no-download",
+                "-j",  # JSON output
+                "--no-warnings",
+                hearing.video_url
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+
+                # Update hearing_date from upload_date
+                if not hearing.hearing_date and data.get('upload_date'):
+                    try:
+                        hearing.hearing_date = datetime.strptime(
+                            data['upload_date'], "%Y%m%d"
+                        ).date()
+                        logger.info(f"Updated hearing_date to {hearing.hearing_date}")
+                    except ValueError:
+                        pass
+
+                # Update duration if missing
+                if not hearing.duration_seconds and data.get('duration'):
+                    hearing.duration_seconds = int(data['duration'])
+                    logger.info(f"Updated duration to {hearing.duration_seconds}s")
+
+                db.commit()
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Metadata fetch timed out for hearing {hearing.id}")
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse metadata JSON for hearing {hearing.id}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch metadata for hearing {hearing.id}: {e}")
+
     def _get_audio_path(self, hearing: Hearing) -> Path:
         """Get the audio file path for a hearing."""
         # Use external_id if available (e.g., YouTube video ID), otherwise hearing ID
@@ -124,6 +181,7 @@ class DownloadStage(BaseStage):
             "--no-playlist",  # Don't download playlists
             "--socket-timeout", "30",
             "--retries", "3",
+            "--impersonate", "chrome",  # Bypass Cloudflare anti-bot
             video_url
         ]
 
