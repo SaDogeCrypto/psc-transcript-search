@@ -382,6 +382,14 @@ class ScraperOrchestrator:
             # Filter for hearing content
             videos = [v for v in videos if is_hearing_video(v)]
 
+            # Apply source-specific title filter if configured
+            config = source.config_json or {}
+            title_filter = config.get('title_filter')
+            if title_filter:
+                title_filter_lower = title_filter.lower()
+                videos = [v for v in videos if title_filter_lower in v.title.lower()]
+                logger.info(f"Title filter '{title_filter}' applied: {len(videos)} videos remaining")
+
             for video in videos:
                 if self._stop_requested.is_set():
                     break

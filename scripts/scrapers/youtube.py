@@ -92,6 +92,57 @@ class YouTubeScraper:
         except ValueError:
             return None
 
+    def _parse_date_from_title(self, title: str) -> Optional[date]:
+        """Extract date from video title using common patterns."""
+        import re
+        if not title:
+            return None
+
+        # Common date patterns in PSC video titles
+        patterns = [
+            # "12/18/2025" or "12/18/25"
+            (r'(\d{1,2})/(\d{1,2})/(\d{2,4})', lambda m: self._build_date(m.group(3), m.group(1), m.group(2))),
+            # "Dec 18, 2025" or "December 18, 2025"
+            (r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})',
+             lambda m: self._build_date_from_month(m.group(3), m.group(1), m.group(2))),
+            # "18 Dec 2025"
+            (r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?,?\s+(\d{4})',
+             lambda m: self._build_date_from_month(m.group(3), m.group(2), m.group(1))),
+            # "2025-12-18"
+            (r'(\d{4})-(\d{2})-(\d{2})', lambda m: self._build_date(m.group(1), m.group(2), m.group(3))),
+        ]
+
+        for pattern, builder in patterns:
+            match = re.search(pattern, title, re.IGNORECASE)
+            if match:
+                try:
+                    return builder(match)
+                except (ValueError, AttributeError):
+                    continue
+        return None
+
+    def _build_date(self, year_str: str, month_str: str, day_str: str) -> Optional[date]:
+        """Build date from string components."""
+        year = int(year_str)
+        if year < 100:
+            year = 2000 + year if year < 50 else 1900 + year
+        month = int(month_str)
+        day = int(day_str)
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return date(year, month, day)
+        return None
+
+    def _build_date_from_month(self, year_str: str, month_str: str, day_str: str) -> Optional[date]:
+        """Build date from month name string."""
+        month_map = {
+            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+        }
+        month = month_map.get(month_str[:3].lower())
+        if month:
+            return self._build_date(year_str, str(month), day_str)
+        return None
+
     def _run_ytdlp(self, args: list[str]) -> tuple[int, str, str]:
         """Run yt-dlp with given arguments."""
         cmd = ["yt-dlp"] + args
@@ -136,6 +187,13 @@ class YouTubeScraper:
         logger.info(f"Fetching videos from {self.channel_url}")
         returncode, stdout, stderr = self._run_ytdlp(args)
 
+        # If /videos tab fails, try without /videos (some channels don't have videos tab)
+        if returncode != 0 and not stdout and self.channel_url.endswith('/videos'):
+            base_url = self.channel_url[:-7]  # Remove /videos
+            logger.info(f"Videos tab failed, trying channel homepage: {base_url}")
+            args[-1] = base_url
+            returncode, stdout, stderr = self._run_ytdlp(args)
+
         if returncode != 0 and not stdout:
             logger.error(f"yt-dlp failed: {stderr}")
             return videos
@@ -166,10 +224,35 @@ class YouTubeScraper:
         if not title or title == '[Deleted video]' or title == '[Private video]':
             return None
 
+        # Try to get upload date from multiple sources
+        upload_date = None
+
+        # 1. Try upload_date field (YYYYMMDD format)
+        if data.get('upload_date'):
+            upload_date = self._parse_upload_date(data.get('upload_date'))
+
+        # 2. Try timestamp field (Unix timestamp)
+        if not upload_date and data.get('timestamp'):
+            try:
+                upload_date = datetime.fromtimestamp(data['timestamp']).date()
+            except (ValueError, OSError):
+                pass
+
+        # 3. Try release_timestamp
+        if not upload_date and data.get('release_timestamp'):
+            try:
+                upload_date = datetime.fromtimestamp(data['release_timestamp']).date()
+            except (ValueError, OSError):
+                pass
+
+        # 4. Fall back to parsing date from title
+        if not upload_date:
+            upload_date = self._parse_date_from_title(title)
+
         return YouTubeVideo(
             video_id=video_id,
             title=title,
-            upload_date=self._parse_upload_date(data.get('upload_date')),
+            upload_date=upload_date,
             duration_seconds=data.get('duration'),
             description=data.get('description', '')[:1000] if data.get('description') else None,
             view_count=data.get('view_count'),
