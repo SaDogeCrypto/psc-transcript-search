@@ -75,7 +75,7 @@ class ExtractStage(BaseStage):
 
     name = "extract"
     in_progress_status = "extracting"
-    complete_status = "extracted"
+    complete_status = "complete"  # Final stage - mark as complete
 
     def __init__(self):
         self._openai_client = None
@@ -115,7 +115,7 @@ class ExtractStage(BaseStage):
         return True
 
     def execute(self, hearing: Hearing, db: Session) -> StageResult:
-        """Extract dockets and optionally generate embeddings."""
+        """Extract dockets using smart extraction pipeline."""
         transcript = db.query(Transcript).filter(Transcript.hearing_id == hearing.id).first()
         if not transcript:
             return StageResult(
@@ -125,22 +125,47 @@ class ExtractStage(BaseStage):
             )
 
         cost_usd = 0.0
-        dockets_found = []
+        state_code = hearing.state.code if hearing.state else None
 
         try:
-            # 1. Extract and link docket numbers
-            state_code = hearing.state.code if hearing.state else None
-            docket_numbers = self._extract_docket_numbers(transcript.full_text, state_code)
+            # Use smart extraction pipeline
+            from app.pipeline.smart_extraction import SmartExtractionPipeline
 
-            for docket_num in docket_numbers:
-                docket = self._get_or_create_docket(docket_num, hearing, db)
-                if docket:
-                    self._link_hearing_to_docket(hearing, docket, db)
-                    dockets_found.append(docket.normalized_id)
+            pipeline = SmartExtractionPipeline(db)
+            candidates = pipeline.process_transcript(
+                text=transcript.full_text,
+                state_code=state_code,
+                hearing_id=hearing.id
+            )
 
-            logger.info(f"Extracted {len(dockets_found)} dockets from hearing {hearing.id}")
+            # Store candidates in extracted_dockets table
+            counts = pipeline.store_candidates(candidates, hearing.id)
 
-            # 2. Optionally generate embeddings for segments
+            logger.info(
+                f"Smart extraction for hearing {hearing.id}: "
+                f"{counts.get('accepted', 0)} accepted, "
+                f"{counts.get('needs_review', 0)} needs review, "
+                f"{counts.get('rejected', 0)} rejected"
+            )
+
+            # Also create/link dockets for accepted candidates (backwards compatibility)
+            dockets_found = []
+            for candidate in candidates:
+                if candidate.status == "accepted":
+                    # Use the matched known docket if available, otherwise create new
+                    if candidate.match_type == "exact" and candidate.matched_docket_id:
+                        docket = self._get_or_create_docket(
+                            candidate.matched_docket_number or candidate.raw_text,
+                            hearing, db
+                        )
+                    else:
+                        docket = self._get_or_create_docket(candidate.raw_text, hearing, db)
+
+                    if docket:
+                        self._link_hearing_to_docket(hearing, docket, db)
+                        dockets_found.append(docket.normalized_id)
+
+            # Optionally generate embeddings for segments
             if GENERATE_EMBEDDINGS:
                 segments = db.query(Segment).filter(Segment.hearing_id == hearing.id).all()
                 if segments:
@@ -155,6 +180,10 @@ class ExtractStage(BaseStage):
                 output={
                     "dockets_found": len(dockets_found),
                     "docket_ids": dockets_found,
+                    "candidates_total": len(candidates),
+                    "candidates_accepted": counts.get("accepted", 0),
+                    "candidates_needs_review": counts.get("needs_review", 0),
+                    "candidates_rejected": counts.get("rejected", 0),
                     "embeddings_generated": GENERATE_EMBEDDINGS,
                 },
                 cost_usd=cost_usd
