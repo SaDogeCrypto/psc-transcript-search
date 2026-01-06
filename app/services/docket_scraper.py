@@ -140,7 +140,7 @@ class DocketScraper:
             return result
 
         # States that require Playwright for JavaScript rendering / bot protection
-        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ')
+        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI')
         if state_code in playwright_states:
             if not PLAYWRIGHT_AVAILABLE:
                 result.error = f"Playwright not installed - required for {state_code} scraping"
@@ -442,6 +442,8 @@ class DocketScraper:
                     result = await self._scrape_california_playwright(page, docket_number, result)
                 elif state_code == 'AZ':
                     result = await self._scrape_arizona_playwright(page, docket_number, result)
+                elif state_code == 'MI':
+                    result = await self._scrape_michigan_playwright(page, docket_number, result)
 
                 await browser.close()
                 return result
@@ -897,6 +899,136 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"AZ scrape error: {str(e)}"
+            return result
+
+    async def _scrape_michigan_playwright(self, page, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """Scrape Michigan PSC E-Dockets using Playwright.
+
+        MI uses a Salesforce Community portal that requires JavaScript.
+        Case numbers follow U-XXXXX format (e.g., U-21122).
+        """
+        # Normalize docket number format
+        docket_upper = docket_number.upper().strip()
+        if not docket_upper.startswith('U-'):
+            docket_upper = f"U-{docket_upper}"
+
+        result.source_url = f"https://mi-psc.my.site.com/s/case/{docket_upper}"
+
+        try:
+            # Go to E-Dockets portal
+            await page.goto("https://mi-psc.my.site.com/s/", timeout=30000)
+            await asyncio.sleep(3)
+
+            # Look for search input
+            search_input = await page.query_selector('input[placeholder*="Search"]')
+            if not search_input:
+                # Try alternative selector
+                search_input = await page.query_selector('input[type="search"]')
+
+            if search_input:
+                await search_input.fill(docket_upper)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(5)
+            else:
+                # Try direct URL navigation
+                await page.goto(f"https://mi-psc.my.site.com/s/global-search/{docket_upper}", timeout=30000)
+                await asyncio.sleep(5)
+
+            # Update source URL to actual page
+            result.source_url = page.url
+
+            # Get page content
+            text = await page.inner_text("body")
+
+            # Check if case was found
+            if "No results found" in text or docket_upper not in text.upper():
+                result.found = False
+                result.error = "Case not found"
+                return result
+
+            result.found = True
+
+            # Try to click on the case result to get details (with shorter timeout)
+            try:
+                case_link = await page.query_selector(f'a:has-text("{docket_upper}")')
+                if case_link:
+                    await case_link.click(timeout=5000)
+                    await asyncio.sleep(3)
+                    text = await page.inner_text("body")
+                    result.source_url = page.url
+            except Exception:
+                # Continue with search results page if click fails
+                pass
+
+            # Extract Case Caption/Title - look for the full "In the matter" text
+            caption_patterns = [
+                r'(In the matter[^.]+\.)',  # Full "In the matter..." sentence
+                r'(In the matter[^\n\t]+)',   # Until newline or tab
+                r'(?:Caption|Title)[:\s]*([^\n\t]+)',
+            ]
+            for pattern in caption_patterns:
+                caption_match = re.search(pattern, text, re.IGNORECASE)
+                if caption_match:
+                    title = caption_match.group(1).strip()
+                    # Clean up UI noise
+                    title = re.sub(r'\s+', ' ', title)  # Normalize whitespace
+                    if len(title) > 20 and 'SORT' not in title.upper():  # Ensure meaningful title
+                        result.title = title[:500]
+                        break
+
+            # Extract utility/company name from "In the matter" or explicit fields
+            # Skip generic UI words like "Sort", "Search", etc.
+            company_patterns = [
+                r'application of ([A-Z][a-zA-Z\s]+(?:Company|Corporation|Inc\.|LLC|Energy|Electric|Gas|Power|Utility))',
+                r'In the matter.*?(?:of|regarding)\s+([A-Z][a-zA-Z\s]+(?:Company|Corporation|Inc\.|LLC|Energy|Electric|Gas|Power|Utility))',
+                r'(?:Company|Applicant|Utility)[:\s]*([A-Z][a-zA-Z\s]{5,})',
+            ]
+            for pattern in company_patterns:
+                company_match = re.search(pattern, text, re.IGNORECASE)
+                if company_match:
+                    company = company_match.group(1).strip()
+                    # Filter out UI elements
+                    if company.lower() not in ['sort', 'search', 'filter', 'results']:
+                        result.utility_name = company[:200]
+                        break
+
+            # Extract case type/industry
+            industry_match = re.search(r'(?:Industry|Type)[:\s]*([^\n]+)', text, re.IGNORECASE)
+            if industry_match:
+                industry = industry_match.group(1).strip().lower()
+                if 'electric' in industry:
+                    result.utility_type = 'Electric'
+                elif 'gas' in industry:
+                    result.utility_type = 'Gas'
+                elif 'telecom' in industry:
+                    result.utility_type = 'Telephone'
+                elif 'water' in industry:
+                    result.utility_type = 'Water'
+
+            # Extract status
+            status_match = re.search(r'(?:Status|Case Status)[:\s]*([^\n]+)', text, re.IGNORECASE)
+            if status_match:
+                status = status_match.group(1).strip().lower()
+                if 'open' in status or 'active' in status or 'pending' in status:
+                    result.status = 'open'
+                elif 'closed' in status or 'completed' in status:
+                    result.status = 'closed'
+                else:
+                    result.status = status[:50]
+
+            # Extract filing date
+            date_match = re.search(r'(?:Filed|Filing Date|Date Filed)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, re.IGNORECASE)
+            if date_match:
+                result.filing_date = self._parse_date(date_match.group(1))
+
+            # If no title found, construct from other fields
+            if not result.title and result.utility_name:
+                result.title = f"{result.utility_name} - Case {docket_upper}"
+
+            return result
+
+        except Exception as e:
+            result.error = f"MI scrape error: {str(e)}"
             return result
 
     def _parse_pennsylvania(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
