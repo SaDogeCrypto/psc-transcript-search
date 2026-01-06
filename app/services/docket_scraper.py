@@ -147,6 +147,10 @@ class DocketScraper:
                 return result
             return await self._scrape_with_playwright(state_code, docket_number, result, config)
 
+        # Connecticut uses Lotus Notes with search-based lookup
+        if state_code == 'CT':
+            return await self._scrape_connecticut(docket_number, result)
+
         # Special URL handling for certain states
         if state_code == 'WA':
             # WA format: UE-220066 -> year=2022, number=220066
@@ -1029,6 +1033,145 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"MI scrape error: {str(e)}"
+            return result
+
+    async def _scrape_connecticut(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """Scrape Connecticut PURA docket using Lotus Notes search.
+
+        CT uses a two-step process:
+        1. Search for the DRN (Docket Record Notice) by docket number
+        2. Fetch the DRN document to extract metadata
+
+        Docket format: XX-XX-XX (e.g., 21-08-05)
+        """
+        # Normalize docket number format (should be XX-XX-XX)
+        docket_clean = docket_number.strip()
+
+        # Base URLs for Connecticut's Lotus Notes system
+        view_id = "8e6fc37a54110e3e852576190052b64d"
+        base_url = "http://www.dpuc.state.ct.us/dockcurr.nsf"
+        search_url = f"{base_url}/{view_id}?SearchView&Query={docket_clean}+DRN&Count=5"
+        result.source_url = search_url
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, verify=False) as client:
+                # Step 1: Search for DRN document
+                search_response = await client.get(search_url)
+                if search_response.status_code != 200:
+                    result.error = f"CT search failed: HTTP {search_response.status_code}"
+                    return result
+
+                search_html = search_response.text
+
+                # Extract document ID from search results
+                # Pattern: /dockcurr.nsf/view_id/DOC_ID?OpenDocument
+                doc_pattern = rf'{view_id}/([a-f0-9]+)\?OpenDocument'
+                doc_match = re.search(doc_pattern, search_html, re.IGNORECASE)
+
+                if not doc_match:
+                    # Check if docket number appears anywhere in search results
+                    if docket_clean not in search_html:
+                        result.found = False
+                        result.error = "Docket not found"
+                        return result
+                    # Found references but no DRN
+                    result.found = True
+                    result.title = f"Connecticut Docket {docket_clean}"
+                    return result
+
+                doc_id = doc_match.group(1)
+                drn_url = f"{base_url}/{view_id}/{doc_id}?OpenDocument"
+                result.source_url = drn_url
+
+                # Step 2: Fetch DRN document
+                drn_response = await client.get(drn_url)
+                if drn_response.status_code != 200:
+                    result.error = f"CT DRN fetch failed: HTTP {drn_response.status_code}"
+                    return result
+
+                html = drn_response.text
+                result.found = True
+
+                # Extract title
+                title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    # Clean up Lotus Notes title format and HTML entities
+                    title = re.sub(r'^Docket Review Notification for \[\s*[\d-]+\s*\]\s*', '', title)
+                    title = re.sub(r'^DRN\s*\[[\d-]+\].*?-\s*', '', title)
+                    title = title.replace('&#8211;', '-').replace('&amp;', '&')
+                    title = title.replace('&#39;', "'").replace('&quot;', '"')
+                    if title and len(title) > 5:
+                        result.title = title[:500]
+
+                # Look for title in body content
+                if not result.title:
+                    # Pattern for docket title in body
+                    body_title = re.search(r'Annual Review[^<]+|Application[^<]+|Investigation[^<]+|Petition[^<]+', html, re.IGNORECASE)
+                    if body_title:
+                        result.title = body_title.group(0).strip()[:500]
+
+                # Extract status (Open/Closed)
+                status_match = re.search(r'(?:Status|Docket Status)[:\s]*(?:<[^>]*>)*\s*(Open|Closed|Active|Inactive)', html, re.IGNORECASE)
+                if status_match:
+                    status = status_match.group(1).lower()
+                    result.status = 'open' if status in ['open', 'active'] else 'closed'
+                else:
+                    # Look for explicit status indicators
+                    if re.search(r'>Closed<|Status:\s*Closed', html, re.IGNORECASE):
+                        result.status = 'closed'
+                    elif re.search(r'>Open<|Status:\s*Open', html, re.IGNORECASE):
+                        result.status = 'open'
+
+                # Extract utility type (Electric, Gas, Water, Telecom)
+                industry_patterns = [
+                    (r'Electric', 'Electric'),
+                    (r'Gas', 'Gas'),
+                    (r'Water|Sewer', 'Water'),
+                    (r'Tele(?:com|phone)|CATV|Communications', 'Telephone'),
+                ]
+                for pattern, utility_type in industry_patterns:
+                    if re.search(pattern, html, re.IGNORECASE):
+                        result.utility_type = utility_type
+                        break
+
+                # Extract utility name if present - look for actual company names
+                utility_patterns = [
+                    r'(?:Utility Name|Company Name)[:\s]*(?:<[^>]*>)*\s*([A-Z][^<\n]{3,})',
+                    r'(?:Connecticut Light|Eversource|United Illuminating|Aquarion|Southern Connecticut Gas|Connecticut Natural Gas)[^<\n]*',
+                ]
+                for pattern in utility_patterns:
+                    utility_match = re.search(pattern, html, re.IGNORECASE)
+                    if utility_match:
+                        utility = utility_match.group(0).strip() if '(' not in pattern else utility_match.group(1).strip()
+                        # Filter out UI elements
+                        if utility and len(utility) > 5 and utility.lower() not in ['types:', 'status:', 'industry:']:
+                            result.utility_name = utility[:200]
+                            break
+
+                # Extract filing date
+                date_match = re.search(r'(?:Filed|Filing Date|Date)[:\s]*(?:<[^>]*>)*\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', html, re.IGNORECASE)
+                if date_match:
+                    result.filing_date = self._parse_date(date_match.group(1))
+
+                # Set docket type from number prefix pattern
+                # CT format: YY-MM-DD where MM indicates category
+                prefix_match = re.match(r'(\d{2})-(\d{2})-', docket_clean)
+                if prefix_match:
+                    month = prefix_match.group(2)
+                    # Different month prefixes may indicate different case types
+                    # 08 is commonly used for annual reviews
+                    if month == '08':
+                        result.docket_type = 'Annual Review'
+
+                # Fallback title if none found
+                if not result.title:
+                    result.title = f"Connecticut PURA Docket {docket_clean}"
+
+                return result
+
+        except Exception as e:
+            result.error = f"CT scrape error: {str(e)}"
             return result
 
     def _parse_pennsylvania(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
