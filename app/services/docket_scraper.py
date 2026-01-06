@@ -155,6 +155,10 @@ class DocketScraper:
         if state_code == 'UT':
             return await self._scrape_utah(docket_number, result)
 
+        # Kentucky uses direct URL pattern
+        if state_code == 'KY':
+            return await self._scrape_kentucky(docket_number, result)
+
         # Special URL handling for certain states
         if state_code == 'WA':
             # WA format: UE-220066 -> year=2022, number=220066
@@ -1302,6 +1306,92 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"UT scrape error: {str(e)}"
+            return result
+
+    async def _scrape_kentucky(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """Scrape Kentucky PSC docket using direct URL.
+
+        KY uses direct URLs like https://psc.ky.gov/Case/ViewCaseFilings/2023-00092
+        Docket format: YYYY-NNNNN (e.g., 2023-00092)
+        """
+        docket_clean = docket_number.strip()
+        url = f"https://psc.ky.gov/Case/ViewCaseFilings/{docket_clean}"
+        result.source_url = url
+
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, verify=False, headers=headers) as client:
+                response = await client.get(url)
+                if response.status_code != 200:
+                    result.error = f"HTTP {response.status_code}"
+                    return result
+
+                html = response.text
+
+                # Check if case exists by looking for case number in page
+                if f">{docket_clean}<" not in html and docket_clean not in html:
+                    result.found = False
+                    result.error = "Case not found"
+                    return result
+
+                result.found = True
+
+                # Extract utility/company name from lblUtilities span
+                utility_match = re.search(r"id=['\"]lblUtilities['\"][^>]*>([^<]+)", html, re.IGNORECASE)
+                if utility_match:
+                    result.utility_name = utility_match.group(1).strip()[:200]
+
+                # Extract case title/nature from lblNature span
+                nature_match = re.search(r"id=['\"]lblNature['\"][^>]*>([^<]+)", html, re.IGNORECASE)
+                if nature_match:
+                    result.title = nature_match.group(1).strip()[:500]
+
+                # Extract service type from lblServiceType span
+                service_match = re.search(r"id=['\"]lblServiceType['\"][^>]*>([^<]+)", html, re.IGNORECASE)
+                if service_match:
+                    service_type = service_match.group(1).strip()
+                    # Map to standard utility types
+                    service_lower = service_type.lower()
+                    if 'electric' in service_lower:
+                        result.utility_type = 'Electric'
+                    elif 'gas' in service_lower:
+                        result.utility_type = 'Gas'
+                    elif 'water' in service_lower:
+                        result.utility_type = 'Water'
+                    elif 'telephone' in service_lower or 'telecom' in service_lower or 'radio' in service_lower:
+                        result.utility_type = 'Telephone'
+                    elif 'sewer' in service_lower:
+                        result.utility_type = 'Sewer'
+                    else:
+                        result.utility_type = service_type[:50]
+
+                # Extract filing date from lblFilingDt span
+                date_match = re.search(r"id=['\"]lblFilingDt['\"][^>]*>([^<]+)", html, re.IGNORECASE)
+                if date_match:
+                    date_str = date_match.group(1).strip()
+                    result.filing_date = self._parse_date(date_str)
+
+                # Check for rate case indicators in title
+                if result.title:
+                    title_lower = result.title.lower()
+                    if 'rate' in title_lower or 'tariff' in title_lower:
+                        result.docket_type = 'Rate Case'
+                    elif 'certificate' in title_lower or 'cpcn' in title_lower:
+                        result.docket_type = 'Certificate'
+                    elif 'complaint' in title_lower:
+                        result.docket_type = 'Complaint'
+
+                # Fallback title
+                if not result.title:
+                    result.title = f"Kentucky PSC Case {docket_clean}"
+
+                return result
+
+        except Exception as e:
+            result.error = f"KY scrape error: {str(e)}"
             return result
 
     def _parse_pennsylvania(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
