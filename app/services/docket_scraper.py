@@ -195,6 +195,8 @@ class DocketScraper:
                     return self._parse_southcarolina(html, result, config)
                 elif state_code == 'MO':
                     return self._parse_missouri(html, result, config)
+                elif state_code == 'DE':
+                    return self._parse_delaware(html, result, config)
                 else:
                     # Generic parsing attempt
                     return self._parse_generic(html, result, config)
@@ -1422,6 +1424,64 @@ class DocketScraper:
                 'WO': 'Other Water',
             }
             result.docket_type = type_map.get(type_code, type_code)
+
+        return result
+
+    def _parse_delaware(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
+        """Parse Delaware PSC DelaFile docket page.
+
+        DelaFile uses span elements with IDs like lblDesc, lblCompanyName, lblUtilityType.
+        """
+        # Check if docket exists
+        if result.docket_number not in html:
+            result.found = False
+            result.error = "Docket not found"
+            return result
+
+        result.found = True
+
+        # Extract Docket Caption/Description (lblDesc)
+        caption_match = re.search(r'id="lblDesc"[^>]*>([^<]+)', html, re.IGNORECASE)
+        if caption_match:
+            result.title = caption_match.group(1).strip()[:500]
+
+        # Extract Company Name (lblCompanyName)
+        company_match = re.search(r'id="lblCompanyName"[^>]*>([^<]+)', html, re.IGNORECASE)
+        if company_match:
+            result.utility_name = company_match.group(1).strip()[:200]
+
+        # Extract Utility Type (lblUtilityType)
+        utility_match = re.search(r'id="lblUtilityType"[^>]*>([^<]+)', html, re.IGNORECASE)
+        if utility_match:
+            utility = utility_match.group(1).strip().lower()
+            type_map = {
+                'electric': 'Electric',
+                'gas': 'Gas',
+                'water': 'Water',
+                'cable': 'Telephone',
+                'telephone': 'Telephone',
+            }
+            result.utility_type = type_map.get(utility, utility.title())
+
+        # Extract Filing Date (lblbFilingDate - note the extra 'b')
+        date_match = re.search(r'id="lblbFilingDate"[^>]*>(\d{1,2}/\d{1,2}/\d{4})', html, re.IGNORECASE)
+        if date_match:
+            result.filing_date = self._parse_date(date_match.group(1))
+
+        # Extract Docket Type (lblDocketType)
+        type_match = re.search(r'id="lblDocketType"[^>]*>([^<]+)', html, re.IGNORECASE)
+        if type_match:
+            result.docket_type = type_match.group(1).strip()[:100]
+
+        # Extract Status (lblStatus)
+        status_match = re.search(r'id="lblStatus"[^>]*>([^<]+)', html, re.IGNORECASE)
+        if status_match:
+            status = status_match.group(1).strip().lower()
+            result.status = 'open' if status in ['open', 'active', 'assigned'] else 'closed'
+
+        # Fallback title
+        if not result.title:
+            result.title = f"Delaware PSC Docket {result.docket_number}"
 
         return result
 
