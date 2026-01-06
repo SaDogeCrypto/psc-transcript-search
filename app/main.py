@@ -5,7 +5,16 @@ Production FastAPI backend for the CanaryScope utility regulatory intelligence p
 Provides both public API endpoints and admin dashboard endpoints.
 """
 import os
+from pathlib import Path
 from contextlib import asynccontextmanager
+
+# Load .env file if it exists (for local development)
+env_file = Path(__file__).parent.parent / ".env"
+if env_file.exists():
+    for line in env_file.read_text().splitlines():
+        if line.strip() and not line.startswith('#') and '=' in line:
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key.strip(), value.strip())
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
