@@ -140,7 +140,7 @@ class DocketScraper:
             return result
 
         # States that require Playwright for JavaScript rendering / bot protection
-        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI')
+        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI', 'KS')
         if state_code in playwright_states:
             if not PLAYWRIGHT_AVAILABLE:
                 result.error = f"Playwright not installed - required for {state_code} scraping"
@@ -458,6 +458,8 @@ class DocketScraper:
                     result = await self._scrape_arizona_playwright(page, docket_number, result)
                 elif state_code == 'MI':
                     result = await self._scrape_michigan_playwright(page, docket_number, result)
+                elif state_code == 'KS':
+                    result = await self._scrape_kansas_playwright(page, docket_number, result)
 
                 await browser.close()
                 return result
@@ -1043,6 +1045,166 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"MI scrape error: {str(e)}"
+            return result
+
+    async def _scrape_kansas_playwright(self, page, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """Scrape Kansas Corporation Commission KCC-Connect using Playwright.
+
+        KS uses a Salesforce Community portal (KCC-Connect) that requires JavaScript.
+        Docket numbers vary in format (e.g., 24-EKCE-0148-STG, 24135E).
+        """
+        docket_clean = docket_number.strip().upper()
+        result.source_url = f"https://kcc-connect.kcc.ks.gov/s/custom-search"
+
+        try:
+            # Go to KCC-Connect search page
+            await page.goto("https://kcc-connect.kcc.ks.gov/s/custom-search", timeout=30000)
+            await asyncio.sleep(4)
+
+            # Look for search input - KCC uses a custom search interface
+            search_input = await page.query_selector('input[placeholder*="Search"]')
+            if not search_input:
+                search_input = await page.query_selector('input[type="text"]')
+            if not search_input:
+                search_input = await page.query_selector('input.slds-input')
+
+            if search_input:
+                await search_input.fill(docket_clean)
+                await asyncio.sleep(1)
+
+                # Try clicking search button
+                search_btn = await page.query_selector('button:has-text("Search")')
+                if search_btn:
+                    await search_btn.click()
+                else:
+                    await page.keyboard.press("Enter")
+
+                await asyncio.sleep(5)
+            else:
+                result.error = "Could not find search input"
+                return result
+
+            # Update source URL
+            result.source_url = page.url
+
+            # Get page content
+            text = await page.inner_text("body")
+
+            # Check if docket was found
+            if "No results" in text or "0 items" in text.lower():
+                result.found = False
+                result.error = "Docket not found"
+                return result
+
+            # Check if our docket appears in the results
+            if docket_clean not in text.upper() and docket_number not in text:
+                result.found = False
+                result.error = "Docket not found in results"
+                return result
+
+            result.found = True
+
+            # Try to click on the docket to get full details
+            try:
+                docket_link = await page.query_selector(f'a:has-text("{docket_clean}")')
+                if not docket_link:
+                    # Try partial match
+                    docket_link = await page.query_selector(f'a:has-text("{docket_number}")')
+                if docket_link:
+                    await docket_link.click(timeout=5000)
+                    await asyncio.sleep(4)
+                    text = await page.inner_text("body")
+                    result.source_url = page.url
+            except Exception:
+                # Continue with search results if click fails
+                pass
+
+            # Extract docket title/caption
+            # UI words to filter out
+            ui_words = ['search', 'sort', 'filter', 'created date', 'actions', 'status',
+                       'docket number', 'company', 'utility', 'type', 'filed', 'open date']
+            title_patterns = [
+                r'(?:Caption|Title|Subject|Matter)[:\s]*([^\n]+)',
+                r'(?:Docket|Case)\s+(?:Title|Description)[:\s]*([^\n]+)',
+                r'In the [Mm]atter of[:\s]*([^\n]+)',
+                r'Application[:\s]*([^\n]+)',
+            ]
+            for pattern in title_patterns:
+                title_match = re.search(pattern, text, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    title = re.sub(r'\s+', ' ', title)
+                    # Filter out UI elements
+                    if len(title) > 15 and title.lower() not in ui_words:
+                        result.title = title[:500]
+                        break
+
+            # Extract company/utility name
+            company_patterns = [
+                r'(?:Company|Utility|Applicant)[:\s]*([A-Z][a-zA-Z\s,\.]+(?:Inc\.|LLC|Company|Corporation|Co\.|Corp\.))',
+                r'Application of ([A-Z][a-zA-Z\s,\.]+)',
+                r'(?:Evergy|Westar|Kansas Gas|Black Hills|Empire|Atmos|Pioneer|Midwest|Southern Pioneer)[A-Za-z\s,]*',
+            ]
+            for pattern in company_patterns:
+                company_match = re.search(pattern, text, re.IGNORECASE)
+                if company_match:
+                    company = company_match.group(1) if '(' in pattern else company_match.group(0)
+                    company = company.strip()
+                    if len(company) > 3 and company.lower() not in ['search', 'sort']:
+                        result.utility_name = company[:200]
+                        break
+
+            # Determine utility type from docket code or content
+            docket_upper = docket_clean.upper()
+            if '-EKCE-' in docket_upper or '-WSEE-' in docket_upper:
+                result.utility_type = 'Electric'
+            elif '-KHGE-' in docket_upper or '-BHGE-' in docket_upper or '-ATME-' in docket_upper:
+                result.utility_type = 'Gas'
+            elif 'electric' in text.lower()[:3000]:
+                result.utility_type = 'Electric'
+            elif 'gas' in text.lower()[:2000]:
+                result.utility_type = 'Gas'
+            elif 'telecom' in text.lower() or 'telephone' in text.lower():
+                result.utility_type = 'Telephone'
+            elif 'water' in text.lower()[:2000]:
+                result.utility_type = 'Water'
+
+            # Extract status (skip UI elements)
+            status_match = re.search(r'(?:Status|Case Status)[:\s]*([^\n]+)', text, re.IGNORECASE)
+            if status_match:
+                status = status_match.group(1).strip().lower()
+                # Filter out UI elements
+                if status not in ui_words and len(status) >= 3:
+                    if 'open' in status or 'active' in status or 'pending' in status:
+                        result.status = 'open'
+                    elif 'closed' in status or 'completed' in status:
+                        result.status = 'closed'
+                    elif len(status) < 50:
+                        result.status = status
+
+            # Extract filing date
+            date_match = re.search(r'(?:Filed|Filing Date|Date Filed|Open Date)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, re.IGNORECASE)
+            if date_match:
+                result.filing_date = self._parse_date(date_match.group(1))
+
+            # Determine case type from docket suffix
+            if '-STG' in docket_upper:
+                result.docket_type = 'Siting'
+            elif '-TAR' in docket_upper or '-RTS' in docket_upper:
+                result.docket_type = 'Rate Case'
+            elif '-COM' in docket_upper:
+                result.docket_type = 'Complaint'
+            elif '-CER' in docket_upper:
+                result.docket_type = 'Certificate'
+
+            # Fallback title
+            if not result.title:
+                result.title = f"Kansas CC Docket {docket_clean}"
+
+            return result
+
+        except Exception as e:
+            result.error = f"KS scrape error: {str(e)}"
             return result
 
     async def _scrape_connecticut(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
