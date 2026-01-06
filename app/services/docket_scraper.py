@@ -140,7 +140,7 @@ class DocketScraper:
             return result
 
         # States that require Playwright for JavaScript rendering / bot protection
-        playwright_states = ('FL', 'OH', 'NY', 'CA')
+        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ')
         if state_code in playwright_states:
             if not PLAYWRIGHT_AVAILABLE:
                 result.error = f"Playwright not installed - required for {state_code} scraping"
@@ -440,6 +440,8 @@ class DocketScraper:
                     result = await self._scrape_newyork_playwright(page, docket_number, result)
                 elif state_code == 'CA':
                     result = await self._scrape_california_playwright(page, docket_number, result)
+                elif state_code == 'AZ':
+                    result = await self._scrape_arizona_playwright(page, docket_number, result)
 
                 await browser.close()
                 return result
@@ -802,6 +804,99 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"CA scrape error: {str(e)}"
+            return result
+
+    async def _scrape_arizona_playwright(self, page, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """Scrape Arizona Corporation Commission eDocket using Playwright.
+
+        AZ uses an Angular SPA that requires search-based navigation.
+        URL: https://edocket.azcc.gov/
+        """
+        result.source_url = f"https://edocket.azcc.gov/search/docket-search?docket={docket_number}"
+
+        try:
+            # Go to eDocket homepage
+            await page.goto("https://edocket.azcc.gov/", timeout=30000)
+            await asyncio.sleep(2)
+
+            # Use quick search to find docket
+            search_input = await page.query_selector("#quickSearchInput")
+            if not search_input:
+                result.error = "Could not find search input on Arizona eDocket"
+                return result
+
+            await search_input.fill(docket_number)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(5)
+
+            # Update source URL to actual page
+            result.source_url = page.url
+
+            # Get page content
+            text = await page.inner_text("body")
+
+            # Check if docket was found
+            if "No results found" in text or docket_number not in text:
+                result.found = False
+                result.error = "Docket not found"
+                return result
+
+            result.found = True
+
+            # Extract Company Name
+            company_match = re.search(r'Company Name\s*([^\n]+)', text)
+            if company_match:
+                result.utility_name = company_match.group(1).strip()
+
+            # Extract Docket Type (utility type)
+            type_match = re.search(r'Docket Type\s*([^\n]+)', text)
+            if type_match:
+                docket_type = type_match.group(1).strip().lower()
+                if 'electric' in docket_type:
+                    result.utility_type = 'Electric'
+                elif 'gas' in docket_type:
+                    result.utility_type = 'Gas'
+                elif 'water' in docket_type or 'sewer' in docket_type:
+                    result.utility_type = 'Water'
+                elif 'telecom' in docket_type or 'telephone' in docket_type:
+                    result.utility_type = 'Telephone'
+
+            # Extract Case Type
+            case_match = re.search(r'Case Type\s*([^\n]+)', text)
+            if case_match:
+                result.docket_type = case_match.group(1).strip()
+
+            # Extract Status
+            status_match = re.search(r'Docket Status\s*([^\n]+)', text)
+            if status_match:
+                status = status_match.group(1).strip().lower()
+                if 'open' in status or 'active' in status or 'pending' in status or 'compliance' in status:
+                    result.status = 'open'
+                elif 'closed' in status:
+                    result.status = 'closed'
+                else:
+                    result.status = status[:50]
+
+            # Extract Filed Date
+            date_match = re.search(r'Filed Date\s*(\d{2}/\d{2}/\d{4})', text)
+            if date_match:
+                result.filing_date = self._parse_date(date_match.group(1))
+
+            # Extract Description as title
+            desc_match = re.search(r'Description\s*(.+?)(?=Year Matter|Special Instructions|$)', text, re.DOTALL)
+            if desc_match:
+                description = desc_match.group(1).strip()
+                if len(description) > 10:
+                    result.title = description[:500]
+
+            # If no description, create title from company and case type
+            if not result.title and result.utility_name:
+                result.title = f"{result.utility_name} - {result.docket_type or 'Case'}"
+
+            return result
+
+        except Exception as e:
+            result.error = f"AZ scrape error: {str(e)}"
             return result
 
     def _parse_pennsylvania(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
