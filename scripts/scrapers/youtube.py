@@ -361,8 +361,28 @@ HEARING_KEYWORDS = [
 ]
 
 EXCLUDE_KEYWORDS = [
+    # Entertainment
     "music", "song", "concert", "entertainment",
     "trailer", "preview", "promo",
+    # Educational/promotional content
+    "meet your", "who we are", "how the puc works",
+    "cold weather rule", "proteccion contra",
+    "call before you dig", "don't be like me",
+    "be utility wise", "callutilitiesnow",
+    "what is energy choice", "how to handle a",
+    "need telephone assistance", "what's up (and down)",
+    # Training videos
+    "professor max powers", "break out room",
+    "fusion joints", "phmsa", "plastic pipe",
+    "utility damage prevention", "vent limited regulator",
+    # Non-utility topics
+    "towing task force", "towing industry",
+    # Conference panels (not hearings)
+    "a glimpse of the future",
+    # Broadband (different regulatory domain)
+    "bead challenge", "bead rebuttal", "bead program",
+    # Generic non-hearing content
+    "opening remarks", "closing remarks",
 ]
 
 
