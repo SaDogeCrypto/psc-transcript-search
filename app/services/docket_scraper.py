@@ -151,6 +151,10 @@ class DocketScraper:
         if state_code == 'CT':
             return await self._scrape_connecticut(docket_number, result)
 
+        # Utah uses WordPress with date-based URLs - need search first
+        if state_code == 'UT':
+            return await self._scrape_utah(docket_number, result)
+
         # Special URL handling for certain states
         if state_code == 'WA':
             # WA format: UE-220066 -> year=2022, number=220066
@@ -1174,6 +1178,130 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"CT scrape error: {str(e)}"
+            return result
+
+    async def _scrape_utah(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """Scrape Utah PSC docket using WordPress search.
+
+        UT uses WordPress with date-based URLs like /2024/01/24/docket-no-24-035-04/
+        We search first to find the URL, then fetch the docket page.
+
+        Docket format: XX-XXX-XX (e.g., 24-035-04)
+        """
+        docket_clean = docket_number.strip()
+        search_url = f"https://psc.utah.gov/?s={docket_clean}"
+        result.source_url = search_url
+
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, verify=False, headers=headers) as client:
+                # Step 1: Search for docket
+                search_response = await client.get(search_url)
+                if search_response.status_code != 200:
+                    result.error = f"UT search failed: HTTP {search_response.status_code}"
+                    return result
+
+                search_html = search_response.text
+
+                # Find docket page URL in search results
+                # Pattern: href="https://psc.utah.gov/YYYY/MM/DD/docket-no-XX-XXX-XX/"
+                docket_slug = f"docket-no-{docket_clean.lower()}"
+                url_pattern = rf'href="(https://psc\.utah\.gov/\d{{4}}/\d{{2}}/\d{{2}}/{docket_slug}/)"'
+                url_match = re.search(url_pattern, search_html, re.IGNORECASE)
+
+                if not url_match:
+                    # Try alternate pattern without trailing slash
+                    url_pattern = rf'href="(https://psc\.utah\.gov/\d{{4}}/\d{{2}}/\d{{2}}/{docket_slug})"'
+                    url_match = re.search(url_pattern, search_html, re.IGNORECASE)
+
+                if not url_match:
+                    # Check if docket appears in search results at all
+                    if docket_clean not in search_html:
+                        result.found = False
+                        result.error = "Docket not found"
+                        return result
+                    # Found in search but couldn't extract URL
+                    result.found = True
+                    result.title = f"Utah PSC Docket {docket_clean}"
+                    return result
+
+                docket_url = url_match.group(1)
+                result.source_url = docket_url
+
+                # Step 2: Fetch docket page
+                docket_response = await client.get(docket_url)
+                if docket_response.status_code != 200:
+                    result.error = f"UT docket fetch failed: HTTP {docket_response.status_code}"
+                    return result
+
+                html = docket_response.text
+                result.found = True
+
+                # Extract title from page title or h1
+                title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    # Clean up WordPress title format "Docket No: XX-XXX-XX | Public Service Commission"
+                    title = re.sub(r'\s*\|\s*Public Service.*$', '', title, flags=re.IGNORECASE)
+                    title = re.sub(r'^Docket No:\s*[\d-]+\s*', '', title)
+                    if title and len(title) > 5:
+                        result.title = title[:500]
+
+                # Look for title in entry content
+                if not result.title:
+                    content_title = re.search(r'<h1[^>]*>([^<]+)</h1>', html)
+                    if content_title:
+                        result.title = content_title.group(1).strip()[:500]
+
+                # Extract utility/company name - look for "Application of X" or company names
+                company_patterns = [
+                    r'Application of ([A-Z][^,\n]+(?:Power|Energy|Gas|Electric|Company|Corporation|Inc\.|LLC))',
+                    r'(?:Rocky Mountain Power|Dominion Energy|Questar|PacifiCorp)[^<\n]*',
+                ]
+                for pattern in company_patterns:
+                    company_match = re.search(pattern, html, re.IGNORECASE)
+                    if company_match:
+                        company = company_match.group(1) if '(' in pattern else company_match.group(0)
+                        result.utility_name = company.strip()[:200]
+                        break
+
+                # Extract utility type from category or content
+                if '/electric/' in docket_url.lower() or 'electric' in html.lower()[:5000]:
+                    result.utility_type = 'Electric'
+                elif '/gas/' in docket_url.lower() or 'gas' in html.lower()[:3000]:
+                    result.utility_type = 'Gas'
+                elif '/telecom/' in docket_url.lower():
+                    result.utility_type = 'Telephone'
+                elif '/water/' in docket_url.lower():
+                    result.utility_type = 'Water'
+
+                # Determine docket type from number prefix
+                # Format: YY-XXX-NN where XXX indicates utility (035=Rocky Mountain Power electric)
+                type_match = re.match(r'(\d{2})-(\d{3})-', docket_clean)
+                if type_match:
+                    utility_code = type_match.group(2)
+                    # 035 = Rocky Mountain Power (electric)
+                    # 057 = Dominion Energy (gas)
+                    if utility_code == '035':
+                        result.utility_type = 'Electric'
+                    elif utility_code == '057':
+                        result.utility_type = 'Gas'
+
+                # Check for rate case indicators
+                if re.search(r'rate increase|rate case|general rate', html, re.IGNORECASE):
+                    result.docket_type = 'Rate Case'
+
+                # Fallback title
+                if not result.title:
+                    result.title = f"Utah PSC Docket {docket_clean}"
+
+                return result
+
+        except Exception as e:
+            result.error = f"UT scrape error: {str(e)}"
             return result
 
     def _parse_pennsylvania(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
