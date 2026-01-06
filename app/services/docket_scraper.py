@@ -147,7 +147,18 @@ class DocketScraper:
                 return result
             return await self._scrape_with_playwright(state_code, docket_number, result, config)
 
-        url = url_template.format(docket=docket_number)
+        # Special URL handling for certain states
+        if state_code == 'WA':
+            # WA format: UE-220066 -> year=2022, number=220066
+            wa_match = re.match(r'^[A-Z]{2}-(\d{2})(\d+)$', docket_number.upper())
+            if wa_match:
+                year = f"20{wa_match.group(1)}"
+                number = wa_match.group(1) + wa_match.group(2)
+                url = f"https://www.utc.wa.gov/casedocket/{year}/{number}"
+            else:
+                url = url_template.format(docket=docket_number)
+        else:
+            url = url_template.format(docket=docket_number)
         result.source_url = url
 
         try:
@@ -178,6 +189,8 @@ class DocketScraper:
                     return self._parse_northcarolina(html, result, config)
                 elif state_code == 'SC':
                     return self._parse_southcarolina(html, result, config)
+                elif state_code == 'MO':
+                    return self._parse_missouri(html, result, config)
                 else:
                     # Generic parsing attempt
                     return self._parse_generic(html, result, config)
@@ -855,34 +868,48 @@ class DocketScraper:
 
     def _parse_washington(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
         """Parse Washington UTC docket page."""
-        # WA format: XX-YYNNNN (e.g., UE-210223)
-        if result.docket_number not in html:
+        # Check if docket exists by looking for docket number in page
+        if result.docket_number not in html and result.docket_number.replace('-', '') not in html:
             result.found = False
             result.error = "Docket not found"
             return result
 
         result.found = True
 
-        # Extract title
-        match = re.search(r'<title>([^<]+)</title>|Docket Title[:\s]*([^<\n]+)', html, re.IGNORECASE)
-        if match:
-            title = (match.group(1) or match.group(2)).strip()
-            result.title = title[:500]
+        # Extract Company from table
+        company_match = re.search(r'<th>Company</th>\s*<td>\s*([^<]+)', html, re.DOTALL)
+        if company_match:
+            result.utility_name = company_match.group(1).strip()
 
-        # Extract utility type from prefix (UE=Electric, UG=Gas, UW=Water, UT=Telecom)
-        wa_match = re.match(r'^(U[EGWT]|TG|TR)-', result.docket_number.upper())
-        if wa_match:
-            prefix = wa_match.group(1)
-            sector_map = {
-                'UE': 'Electric', 'UG': 'Gas', 'UW': 'Water', 'UT': 'Telephone',
-                'TG': 'Other', 'TR': 'Transportation'
-            }
-            result.utility_type = sector_map.get(prefix)
+        # Extract Filing Type as title
+        type_match = re.search(r'<th>Filing Type</th>\s*<td>([^<]+)</td>', html, re.DOTALL)
+        if type_match:
+            result.docket_type = type_match.group(1).strip()
+            result.title = f"{result.utility_name or 'Unknown'} - {result.docket_type}"
 
-        # Extract status
-        status_match = re.search(r'Status[:\s]*([^<\n]+)', html, re.IGNORECASE)
+        # Extract Industry
+        industry_match = re.search(r'<th>Industry \(Code\)</th>\s*<td>([^<]+)</td>', html, re.DOTALL)
+        if industry_match:
+            industry = industry_match.group(1).strip().lower()
+            if 'electric' in industry:
+                result.utility_type = 'Electric'
+            elif 'gas' in industry:
+                result.utility_type = 'Gas'
+            elif 'water' in industry:
+                result.utility_type = 'Water'
+            elif 'telecom' in industry or 'telephone' in industry:
+                result.utility_type = 'Telephone'
+
+        # Extract Status
+        status_match = re.search(r'<th>Status</th>\s*<td>([^<]+)</td>', html, re.DOTALL)
         if status_match:
-            result.status = status_match.group(1).strip().lower()
+            status = status_match.group(1).strip().lower()
+            result.status = 'open' if 'open' in status or 'pending' in status else 'closed'
+
+        # Extract Filed Date
+        date_match = re.search(r'<th>Filed Date</th>\s*<td>(\d{2}/\d{2}/\d{4})</td>', html, re.DOTALL)
+        if date_match:
+            result.filing_date = self._parse_date(date_match.group(1))
 
         return result
 
@@ -963,6 +990,68 @@ class DocketScraper:
             suffix = sc_match.group(1)
             sector_map = {'E': 'Electric', 'G': 'Gas', 'W': 'Water', 'C': 'Telephone', 'T': 'Transportation'}
             result.utility_type = sector_map.get(suffix)
+
+        return result
+
+    def _parse_missouri(self, html: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
+        """Parse Missouri PSC EFIS docket page."""
+        # Check if docket exists - title format is "Docket Sheet - XX-YYYY-NNNN"
+        if result.docket_number not in html:
+            result.found = False
+            return result
+
+        result.found = True
+
+        # Extract title from page title: "Docket Sheet - TO-2024-0033 - EFIS"
+        title_match = re.search(r'<title>Docket Sheet - ([^<]+) - EFIS</title>', html)
+        if title_match:
+            result.title = f"Case {title_match.group(1).strip()}"
+
+        # Extract status: "Closed (4/21/2024)" or "Open"
+        status_match = re.search(r'Status\s*</div>\s*<div[^>]*>\s*(\w+)', html, re.DOTALL)
+        if status_match:
+            status = status_match.group(1).lower()
+            result.status = 'open' if 'open' in status else 'closed' if 'closed' in status else status
+
+        # Extract utility type
+        utility_match = re.search(r'Utility Type\s*</div>\s*<div[^>]*>([^<]+)</div>', html, re.DOTALL)
+        if utility_match:
+            utility_type = utility_match.group(1).strip()
+            type_map = {
+                'electric': 'Electric',
+                'gas': 'Gas',
+                'telephone': 'Telephone',
+                'water': 'Water',
+                'sewer': 'Water',
+            }
+            for key, value in type_map.items():
+                if key in utility_type.lower():
+                    result.utility_type = value
+                    break
+
+        # Extract company name from link
+        company_match = re.search(r'/Company/Display/\d+[^>]*>([^<]+)</a>', html)
+        if company_match:
+            result.utility_name = company_match.group(1).strip()
+
+        # Extract case type from docket number prefix
+        # MO format: XX-YYYY-NNNN where XX is type code
+        type_code_match = re.match(r'^([A-Z]{2})-', result.docket_number)
+        if type_code_match:
+            type_code = type_code_match.group(1)
+            type_map = {
+                'ER': 'Rate Case',
+                'EO': 'Other Electric',
+                'EA': 'Application',
+                'EC': 'Complaint',
+                'GR': 'Rate Case',
+                'GO': 'Other Gas',
+                'TO': 'Other Telephone',
+                'TR': 'Rate Case',
+                'WR': 'Rate Case',
+                'WO': 'Other Water',
+            }
+            result.docket_type = type_map.get(type_code, type_code)
 
         return result
 
