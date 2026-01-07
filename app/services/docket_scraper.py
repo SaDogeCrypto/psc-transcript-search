@@ -140,7 +140,7 @@ class DocketScraper:
             return result
 
         # States that require Playwright for JavaScript rendering / bot protection
-        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI', 'KS')
+        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI', 'KS', 'MN')
         if state_code in playwright_states:
             if not PLAYWRIGHT_AVAILABLE:
                 result.error = f"Playwright not installed - required for {state_code} scraping"
@@ -460,6 +460,8 @@ class DocketScraper:
                     result = await self._scrape_michigan_playwright(page, docket_number, result)
                 elif state_code == 'KS':
                     result = await self._scrape_kansas_playwright(page, docket_number, result)
+                elif state_code == 'MN':
+                    result = await self._scrape_minnesota_playwright(page, docket_number, result)
 
                 await browser.close()
                 return result
@@ -1205,6 +1207,139 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"KS scrape error: {str(e)}"
+            return result
+
+    async def _scrape_minnesota_playwright(self, page, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """Scrape Minnesota PUC eDockets using Playwright.
+
+        MN uses Cloudflare Turnstile protection that requires browser automation.
+        Docket format: YY-NNN (e.g., 22-221) or full format with year prefix.
+        URL: https://www.edockets.state.mn.us/documents?docketNumber={docket}
+        """
+        docket_clean = docket_number.strip()
+        url = f"https://www.edockets.state.mn.us/documents?docketNumber={docket_clean}"
+        result.source_url = url
+
+        try:
+            # Navigate to the docket page - Turnstile will auto-solve in headless
+            await page.goto(url, timeout=60000)
+
+            # Wait for potential Turnstile challenge to auto-complete
+            await asyncio.sleep(8)
+
+            # Check if we're still on the security check page
+            page_title = await page.title()
+            max_retries = 3
+            retry_count = 0
+            while "Security check" in page_title and retry_count < max_retries:
+                # Wait longer for Turnstile to complete
+                await asyncio.sleep(5)
+                page_title = await page.title()
+                retry_count += 1
+
+            # Try waiting for page content to load
+            try:
+                await page.wait_for_selector("body", timeout=10000)
+            except Exception:
+                pass
+
+            # Update URL after any redirects
+            result.source_url = page.url
+
+            # Get page content
+            text = await page.inner_text("body")
+
+            # Check if docket was found
+            if "No documents found" in text or "not found" in text.lower():
+                result.found = False
+                result.error = "Docket not found"
+                return result
+
+            # Check if we're still blocked
+            if "Security check" in text or "verify your browser" in text.lower():
+                result.found = False
+                result.error = "Blocked by Cloudflare Turnstile"
+                return result
+
+            # Check if docket number appears in results
+            if docket_clean not in text and docket_clean.replace("-", "") not in text:
+                result.found = False
+                result.error = "Docket not found in results"
+                return result
+
+            result.found = True
+
+            # Extract docket title - MN eDockets shows title in search results
+            title_patterns = [
+                r'(?:Title|Caption|Subject)[:\s]*([^\n]+)',
+                r'In the [Mm]atter of[:\s]*([^\n]+)',
+                r'(?:Docket|Case)\s+(?:Title|Description)[:\s]*([^\n]+)',
+            ]
+            for pattern in title_patterns:
+                title_match = re.search(pattern, text, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    title = re.sub(r'\s+', ' ', title)
+                    if len(title) > 10:
+                        result.title = title[:500]
+                        break
+
+            # Extract company/utility name
+            company_patterns = [
+                r'(?:Company|Utility|Petitioner|Applicant)[:\s]*([A-Z][a-zA-Z\s,\.]+(?:Inc\.|LLC|Company|Corporation|Co\.|Corp\.))',
+                r'(?:Xcel Energy|Minnesota Power|Otter Tail Power|Great Plains|CenterPoint|MERC)[A-Za-z\s,]*',
+                r'In the [Mm]atter of[:\s]*([A-Z][a-zA-Z\s,]+?)(?:\'s|for|regarding)',
+            ]
+            for pattern in company_patterns:
+                company_match = re.search(pattern, text, re.IGNORECASE)
+                if company_match:
+                    company = company_match.group(1) if '(' in pattern else company_match.group(0)
+                    company = company.strip()
+                    if len(company) > 3:
+                        result.utility_name = company[:200]
+                        break
+
+            # Determine utility type from content
+            text_lower = text.lower()[:5000]
+            if 'electric' in text_lower or 'power' in text_lower:
+                result.utility_type = 'Electric'
+            elif 'gas' in text_lower or 'natural gas' in text_lower:
+                result.utility_type = 'Gas'
+            elif 'telecom' in text_lower or 'telephone' in text_lower:
+                result.utility_type = 'Telephone'
+            elif 'water' in text_lower:
+                result.utility_type = 'Water'
+
+            # Extract status
+            status_match = re.search(r'(?:Status|Case Status)[:\s]*([^\n]+)', text, re.IGNORECASE)
+            if status_match:
+                status = status_match.group(1).strip().lower()
+                if 'open' in status or 'active' in status or 'pending' in status:
+                    result.status = 'open'
+                elif 'closed' in status or 'completed' in status:
+                    result.status = 'closed'
+
+            # Extract filing date
+            date_match = re.search(r'(?:Filed|Filing Date|Date Filed|Open Date)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, re.IGNORECASE)
+            if date_match:
+                result.filing_date = self._parse_date(date_match.group(1))
+
+            # Determine case type
+            if 'rate' in text_lower:
+                result.docket_type = 'Rate Case'
+            elif 'certificate' in text_lower or 'permit' in text_lower:
+                result.docket_type = 'Certificate'
+            elif 'complaint' in text_lower:
+                result.docket_type = 'Complaint'
+
+            # Fallback title
+            if not result.title:
+                result.title = f"Minnesota PUC Docket {docket_clean}"
+
+            return result
+
+        except Exception as e:
+            result.error = f"MN scrape error: {str(e)}"
             return result
 
     async def _scrape_connecticut(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
