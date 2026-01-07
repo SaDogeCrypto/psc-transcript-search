@@ -31,6 +31,13 @@ openai-whisper>=20231117
 python-dotenv>=1.0.0
 tenacity>=8.2.3
 
+# Fuzzy matching
+rapidfuzz>=3.6.0
+
+# Web scraping
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
 # Azure Communication Services (email)
 azure-communication-email>=1.0.0
 

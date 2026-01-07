@@ -141,6 +141,18 @@ STATE_DOCKET_RULES = {
         ],
         "description": "YY-NNNN-XX-XXX (e.g., 25-0594-EL-AIR)",
     },
+    "AZ": {
+        "patterns": [
+            # Arizona format: L-NNNNN[A]-YY-NNNN (e.g., T-21349A-25-0016)
+            (r'\b([A-Z]-\d{5}[A-Z]?-\d{2}-\d{4})\b', "Arizona full docket format"),
+            # Partial format: YY-NNNN
+            (r'\b(\d{2}-\d{4})\b', "Arizona short format"),
+        ],
+        "validators": [
+            ("format", lambda x: bool(re.match(r'^[A-Z]-\d{5}[A-Z]?-\d{2}-\d{4}$', x) or re.match(r'^\d{2}-\d{4}$', x)), "Must match AZ format"),
+        ],
+        "description": "L-NNNNN[A]-YY-NNNN (e.g., T-21349A-25-0016)",
+    },
 }
 
 # Generic patterns for states without specific rules
@@ -555,6 +567,15 @@ class SmartExtractionPipeline:
     def _calculate_confidence(self, candidate: CandidateDocket):
         """Calculate final confidence score and status."""
 
+        # EXACT MATCH TO KNOWN DOCKET = AUTO-ACCEPT
+        # If we have an exact match to a known docket, accept it regardless of format/context
+        # The format may be "incomplete" (e.g., "21-902" instead of "21-902-EL-RDR") but
+        # if it matches a known docket, that's good enough
+        if candidate.match_type == "exact":
+            candidate.confidence = 95  # High confidence
+            candidate.status = "accepted"
+            return
+
         # Check for "new docket candidate" - valid format + good context but no known match
         # These should be flagged for review, not rejected
         is_new_docket_candidate = (
@@ -584,10 +605,6 @@ class SmartExtractionPipeline:
         # Fuzzy bonus if we have a fuzzy match
         if candidate.match_type == "fuzzy" and candidate.fuzzy_score >= 70:
             confidence += candidate.fuzzy_score * self.WEIGHTS['fuzzy_bonus']
-
-        # Exact match bonus
-        if candidate.match_type == "exact":
-            confidence = min(100, confidence + 20)
 
         candidate.confidence = int(min(100, confidence))
 
@@ -623,7 +640,12 @@ class SmartExtractionPipeline:
     # -------------------------------------------------------------------------
 
     def _suggest_corrections(self, candidate: CandidateDocket):
-        """Suggest corrections based on fuzzy matches and context."""
+        """Suggest corrections based on fuzzy matches and context.
+
+        IMPORTANT: Only suggest a correction if the context actually supports it.
+        A digit transposition to a known docket is only valid if the known docket's
+        title/company matches what's being discussed in the transcript.
+        """
         if candidate.match_type == "exact":
             return  # No correction needed
 
@@ -632,39 +654,84 @@ class SmartExtractionPipeline:
 
         best = candidate.fuzzy_candidates[0]
         evidence = []
+        context_supports = False
 
-        # Build evidence
+        # Combine all context for checking
+        full_context = f"{candidate.context_before} {candidate.context_after}".lower()
+        # Extensive stop word list - these don't indicate a real match
+        stop_words = {
+            'the', 'of', 'and', 'a', 'an', 'in', 'for', 'to', 'is', 'this', 'that',
+            'on', 'at', 'by', 'with', 'from', 'as', 'or', 'be', 'are', 'was', 'were',
+            'it', 'its', 'we', 'our', 'they', 'their', 'he', 'she', 'his', 'her',
+            'item', 'number', 'case', 'docket', 'project', 'under', 'section',
+            'order', 'motion', 'approved', 'all', 'will', 'can', 'may', 'shall',
+            'has', 'have', 'had', 'been', 'being', 'would', 'could', 'should',
+            'not', 'no', 'yes', 'any', 'each', 'every', 'some', 'other',
+            'first', 'second', 'third', 'next', 'last', 'new', 'old',
+        }
+        context_words = set(full_context.split()) - stop_words
+
+        # Check if context supports this correction
+        if best.title:
+            # Extract significant words from the known docket title
+            title_stop_words = {
+                'the', 'of', 'and', 'a', 'an', 'in', 'for', 'to', 'on', 'at', 'by',
+                'inc', 'llc', 'corp', 'company', 'co', 'corporation', 'limited',
+                'application', 'complaint', 'petition', 'request', 'filing', 'case',
+                'against', 'regarding', 'concerning', 're', 'matter',
+            }
+            title_words = set(best.title.lower().split()) - title_stop_words
+            overlap = title_words & context_words
+
+            # Require at least one MEANINGFUL word overlap (not just common words)
+            if overlap and len(overlap) >= 1:
+                # At least one significant word from the title appears in context
+                context_supports = True
+                evidence.append(f"Context matches title: {overlap}")
+            elif len(title_words) > 0:
+                # Title has words but none match context - this is likely a BAD suggestion
+                logger.debug(f"Skipping suggestion {best.docket_number} - title '{best.title}' doesn't match context")
+                return  # Don't suggest this correction
+
+        # Build evidence for the error type
         if best.error_type == "digit_drop":
             evidence.append(f"Missing digit pattern: {candidate.raw_text} → {best.docket_number}")
         elif best.error_type == "transposition":
             evidence.append(f"Digit transposition: {candidate.raw_text} → {best.docket_number}")
+        elif best.error_type and "context" in best.error_type:
+            # Context-boosted match - already validated
+            context_supports = True
 
         if best.title:
             evidence.append(f"Known docket: '{best.title}'")
 
-        # Check if context supports this correction
-        if best.title and candidate.context_after:
-            title_words = set(best.title.lower().split())
-            context_words = set(candidate.context_after.lower().split())
-            overlap = title_words & context_words - {'the', 'of', 'and', 'a', 'an'}
-            if overlap:
-                evidence.append(f"Context matches title: {overlap}")
+        # Only suggest if we have context support OR the format is clearly invalid
+        # (e.g., wrong number of digits which strongly suggests transcription error)
+        format_clearly_wrong = not candidate.format_valid and "length" in str(candidate.format_issues)
 
-        if evidence:
+        if context_supports or format_clearly_wrong:
             candidate.suggested_docket_id = best.docket_id
             candidate.suggested_correction = best.docket_number
-            candidate.correction_confidence = best.score
+            # Reduce confidence if no context support
+            candidate.correction_confidence = best.score if context_supports else max(40, best.score - 30)
             candidate.correction_evidence = evidence
+        else:
+            # No suggestion - context doesn't support it
+            logger.debug(f"No suggestion for {candidate.raw_text} - no context support for {best.docket_number}")
 
     # -------------------------------------------------------------------------
     # Deduplication
     # -------------------------------------------------------------------------
 
     def _deduplicate(self, candidates: List[CandidateDocket]) -> List[CandidateDocket]:
-        """Deduplicate candidates, keeping highest confidence."""
+        """Deduplicate candidates, keeping highest confidence.
+
+        Handles cases like "21-902" vs "21-902-" being the same docket.
+        """
         seen = {}
         for c in candidates:
-            key = c.normalized_id
+            # Normalize key by stripping trailing punctuation
+            key = c.normalized_id.rstrip('-').rstrip('.')
             if key not in seen or c.confidence > seen[key].confidence:
                 seen[key] = c
         return list(seen.values())

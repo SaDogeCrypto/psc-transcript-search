@@ -1,11 +1,8 @@
 """
-Extract Stage - Extracts docket numbers and generates embeddings.
+Extract Stage - Generates embeddings for semantic search.
 
-This final pipeline stage:
-1. Extracts docket numbers from transcript text
-2. Creates/updates Docket records
-3. Links hearings to dockets via HearingDocket junction
-4. Optionally generates embeddings for semantic search
+This final pipeline stage generates vector embeddings for transcript segments
+to enable semantic search functionality.
 
 Supports:
 - Azure OpenAI (if AZURE_OPENAI_ENDPOINT is set)
@@ -13,15 +10,13 @@ Supports:
 """
 
 import os
-import re
 import logging
-from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List
 
 from sqlalchemy.orm import Session
 
 from app.pipeline.stages.base import BaseStage, StageResult
-from app.models.database import Hearing, Transcript, Segment, Docket, HearingDocket, State, PipelineJob
+from app.models.database import Hearing, Transcript, Segment, PipelineJob
 
 logger = logging.getLogger(__name__)
 
@@ -41,41 +36,12 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_COST_PER_1M_TOKENS = 0.02  # text-embedding-3-small
 
 
-# Docket number patterns by state
-DOCKET_PATTERNS = {
-    # Generic patterns (work for most states)
-    "generic": [
-        r'\b(\d{2}-\d{3,6}(?:-[A-Z]{2,3})?)\b',  # e.g., 24-00123, 24-00123-EL
-        r'\b([A-Z]\.\d{2}-\d{2}-\d{3,4})\b',  # e.g., A.24-01-001 (California)
-        r'\b(Docket\s*(?:No\.?\s*)?[\d-]+)\b',  # e.g., Docket No. 123456
-        r'\b(Case\s*(?:No\.?\s*)?[\d-]+)\b',  # e.g., Case No. 123456
-    ],
-    # State-specific patterns
-    "GA": [
-        r'\b(\d{5})\b',  # Georgia uses 5-digit dockets like 44160
-        r'\b(Docket\s*(?:No\.?\s*)?\d{5})\b',
-    ],
-    "CA": [
-        r'\b([A-Z]\.\d{2}-\d{2}-\d{3})\b',  # A.24-01-001, R.23-05-018
-        r'\b(Application\s*\d{2}-\d{2}-\d{3})\b',
-    ],
-    "TX": [
-        r'\b(\d{5})\b',  # Texas uses 5-digit dockets
-        r'\b(Project\s*No\.?\s*\d{5})\b',
-    ],
-    "FL": [
-        r'\b(\d{6,8}-[A-Z]{2})\b',  # e.g., 20240001-EI
-        r'\b(Docket\s*(?:No\.?\s*)?\d{6,8}-[A-Z]{2})\b',
-    ],
-}
-
-
 class ExtractStage(BaseStage):
-    """Extract dockets and generate embeddings."""
+    """Generate embeddings for transcript segments."""
 
     name = "extract"
     in_progress_status = "extracting"
-    complete_status = "complete"  # Final stage - mark as complete
+    complete_status = "extracted"  # Fixed: was incorrectly set to "complete"
 
     def __init__(self):
         self._openai_client = None
@@ -106,8 +72,11 @@ class ExtractStage(BaseStage):
 
     def validate(self, hearing: Hearing, db: Session) -> bool:
         """Check if transcript exists."""
-        transcript = db.query(Transcript).filter(Transcript.hearing_id == hearing.id).first()
+        # Accept matched (normal flow) or extracting (retry)
+        if hearing.status not in ("matched", "extracting"):
+            return False
 
+        transcript = db.query(Transcript).filter(Transcript.hearing_id == hearing.id).first()
         if not transcript:
             logger.warning(f"No transcript found for hearing {hearing.id}")
             return False
@@ -115,160 +84,31 @@ class ExtractStage(BaseStage):
         return True
 
     def execute(self, hearing: Hearing, db: Session) -> StageResult:
-        """Extract dockets using smart extraction pipeline."""
-        transcript = db.query(Transcript).filter(Transcript.hearing_id == hearing.id).first()
-        if not transcript:
-            return StageResult(
-                success=False,
-                error="No transcript found",
-                should_retry=False
-            )
-
+        """Generate embeddings for transcript segments."""
         cost_usd = 0.0
-        state_code = hearing.state.code if hearing.state else None
+        segments_count = 0
 
-        try:
-            # Use smart extraction pipeline
-            from app.pipeline.smart_extraction import SmartExtractionPipeline
+        # Generate embeddings if enabled
+        if GENERATE_EMBEDDINGS:
+            segments = db.query(Segment).filter(Segment.hearing_id == hearing.id).all()
+            if segments:
+                segments_count = len(segments)
+                embedding_cost = self._generate_embeddings(segments, db)
+                cost_usd += embedding_cost
+                logger.info(f"Generated embeddings for {segments_count} segments, ${embedding_cost:.4f}")
+        else:
+            logger.info(f"Embeddings disabled, skipping for hearing {hearing.id}")
 
-            pipeline = SmartExtractionPipeline(db)
-            candidates = pipeline.process_transcript(
-                text=transcript.full_text,
-                state_code=state_code,
-                hearing_id=hearing.id
-            )
+        db.commit()
 
-            # Store candidates in extracted_dockets table
-            counts = pipeline.store_candidates(candidates, hearing.id)
-
-            logger.info(
-                f"Smart extraction for hearing {hearing.id}: "
-                f"{counts.get('accepted', 0)} accepted, "
-                f"{counts.get('needs_review', 0)} needs review, "
-                f"{counts.get('rejected', 0)} rejected"
-            )
-
-            # Also create/link dockets for accepted candidates (backwards compatibility)
-            dockets_found = []
-            for candidate in candidates:
-                if candidate.status == "accepted":
-                    # Use the matched known docket if available, otherwise create new
-                    if candidate.match_type == "exact" and candidate.matched_docket_id:
-                        docket = self._get_or_create_docket(
-                            candidate.matched_docket_number or candidate.raw_text,
-                            hearing, db
-                        )
-                    else:
-                        docket = self._get_or_create_docket(candidate.raw_text, hearing, db)
-
-                    if docket:
-                        self._link_hearing_to_docket(hearing, docket, db)
-                        dockets_found.append(docket.normalized_id)
-
-            # Optionally generate embeddings for segments
-            if GENERATE_EMBEDDINGS:
-                segments = db.query(Segment).filter(Segment.hearing_id == hearing.id).all()
-                if segments:
-                    embedding_cost = self._generate_embeddings(segments, db)
-                    cost_usd += embedding_cost
-                    logger.info(f"Generated embeddings for {len(segments)} segments, ${embedding_cost:.4f}")
-
-            db.commit()
-
-            return StageResult(
-                success=True,
-                output={
-                    "dockets_found": len(dockets_found),
-                    "docket_ids": dockets_found,
-                    "candidates_total": len(candidates),
-                    "candidates_accepted": counts.get("accepted", 0),
-                    "candidates_needs_review": counts.get("needs_review", 0),
-                    "candidates_rejected": counts.get("rejected", 0),
-                    "embeddings_generated": GENERATE_EMBEDDINGS,
-                },
-                cost_usd=cost_usd
-            )
-
-        except Exception as e:
-            logger.exception(f"Extract error for hearing {hearing.id}")
-            return StageResult(
-                success=False,
-                error=f"Extract error: {str(e)}",
-                should_retry=True
-            )
-
-    def _extract_docket_numbers(self, text: str, state_code: Optional[str] = None) -> List[str]:
-        """Extract docket numbers from text using regex patterns."""
-        docket_numbers = set()
-
-        # Get patterns for this state plus generic patterns
-        patterns = DOCKET_PATTERNS.get("generic", []).copy()
-        if state_code and state_code in DOCKET_PATTERNS:
-            patterns.extend(DOCKET_PATTERNS[state_code])
-
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                # Clean up the match
-                docket = match.strip()
-                # Skip very short matches (likely false positives)
-                if len(docket) >= 4:
-                    docket_numbers.add(docket)
-
-        return list(docket_numbers)
-
-    def _normalize_docket_id(self, docket_number: str, state_code: Optional[str]) -> str:
-        """Create normalized ID for docket (e.g., GA-44160)."""
-        # Remove common prefixes
-        cleaned = re.sub(r'^(Docket|Case|Application|Project)\s*(No\.?\s*)?', '', docket_number, flags=re.IGNORECASE)
-        cleaned = cleaned.strip()
-
-        if state_code:
-            return f"{state_code}-{cleaned}"
-        return cleaned
-
-    def _get_or_create_docket(self, docket_number: str, hearing: Hearing, db: Session) -> Optional[Docket]:
-        """Get existing docket or create new one."""
-        state_code = hearing.state.code if hearing.state else None
-        normalized_id = self._normalize_docket_id(docket_number, state_code)
-
-        # Check for existing
-        docket = db.query(Docket).filter(Docket.normalized_id == normalized_id).first()
-
-        if docket:
-            # Update last mentioned
-            docket.last_mentioned_at = datetime.now(timezone.utc)
-            docket.mention_count = (docket.mention_count or 0) + 1
-            return docket
-
-        # Create new docket
-        docket = Docket(
-            state_id=hearing.state_id,
-            docket_number=docket_number,
-            normalized_id=normalized_id,
-            first_seen_at=datetime.now(timezone.utc),
-            last_mentioned_at=datetime.now(timezone.utc),
-            mention_count=1,
+        return StageResult(
+            success=True,
+            output={
+                "embeddings_generated": GENERATE_EMBEDDINGS,
+                "segments_processed": segments_count,
+            },
+            cost_usd=cost_usd
         )
-        db.add(docket)
-        db.flush()
-
-        logger.info(f"Created new docket: {normalized_id}")
-        return docket
-
-    def _link_hearing_to_docket(self, hearing: Hearing, docket: Docket, db: Session):
-        """Create HearingDocket junction record if not exists."""
-        existing = db.query(HearingDocket).filter(
-            HearingDocket.hearing_id == hearing.id,
-            HearingDocket.docket_id == docket.id
-        ).first()
-
-        if not existing:
-            link = HearingDocket(
-                hearing_id=hearing.id,
-                docket_id=docket.id,
-            )
-            db.add(link)
 
     def _generate_embeddings(self, segments: List[Segment], db: Session) -> float:
         """Generate embeddings for segments using OpenAI."""
@@ -310,10 +150,16 @@ class ExtractStage(BaseStage):
         cost_usd = (total_tokens * EMBEDDING_COST_PER_1M_TOKENS) / 1_000_000
         return cost_usd
 
-    def on_error(self, hearing: Hearing, job: PipelineJob, result: StageResult, db: Session):
-        """Clean up partial extraction on error."""
-        # Remove hearing-docket links created in this run
-        # (We don't delete dockets themselves as they might be referenced elsewhere)
-        db.query(HearingDocket).filter(HearingDocket.hearing_id == hearing.id).delete()
+    def on_start(self, hearing: Hearing, job: PipelineJob, db: Session):
+        """Set hearing status to extracting."""
+        hearing.status = self.in_progress_status
         db.commit()
-        logger.info(f"Cleaned up partial extraction for hearing {hearing.id}")
+
+    def on_success(self, hearing: Hearing, job: PipelineJob, result: StageResult, db: Session):
+        """Set hearing status to extracted."""
+        hearing.status = self.complete_status
+        db.commit()
+
+    def on_error(self, hearing: Hearing, job: PipelineJob, result: StageResult, db: Session):
+        """Handle extraction error."""
+        logger.error(f"Extract failed for hearing {hearing.id}: {result.error}")

@@ -412,3 +412,165 @@ export async function toggleSchedule(scheduleId: number): Promise<{ enabled: boo
 export async function runScheduleNow(scheduleId: number): Promise<{ message: string }> {
   return fetchAPI(`/admin/pipeline/schedules/${scheduleId}/run-now`, { method: 'POST' });
 }
+
+// =============================================================================
+// DOCKET DISCOVERY & MATCHING
+// =============================================================================
+
+export interface DocketSource {
+  id: number;
+  state_code: string;
+  state_name: string;
+  commission_name: string | null;
+  search_url: string | null;
+  scraper_type: string | null;
+  enabled: boolean;
+  last_scraped_at: string | null;
+  last_scrape_count: number | null;
+  last_error: string | null;
+}
+
+export interface KnownDocket {
+  id: number;
+  state_code: string;
+  docket_number: string;
+  normalized_id: string;
+  year: number | null;
+  sector: string | null;
+  title: string | null;
+  utility_name: string | null;
+  status: string | null;
+  case_type: string | null;
+  source_url: string | null;
+}
+
+export interface DataQualityStats {
+  docket_confidence: {
+    verified: number;
+    likely: number;
+    possible: number;
+    unverified: number;
+  };
+  known_dockets: number;
+  docket_sources: {
+    total: number;
+    enabled: number;
+  };
+}
+
+export interface ExtendedPipelineStatus {
+  pipeline_status: string;
+  discovery: {
+    docket_sources: number;
+    docket_sources_pending: number;
+    hearing_sources: number;
+    known_dockets: number;
+  };
+  processing: {
+    download_pending: number;
+    transcribe_pending: number;
+    analyze_pending: number;
+    match_pending: number;
+    complete: number;
+  };
+  data_quality: {
+    verified: number;
+    likely: number;
+    possible: number;
+    unverified: number;
+  };
+  today: {
+    processed: number;
+    cost: number;
+    errors: number;
+  };
+}
+
+export interface DocketDiscoveryRequest {
+  states?: string[];
+  year?: number;
+  limit_per_state?: number;
+}
+
+export interface DocketDiscoveryResponse {
+  total_scraped: number;
+  total_new: number;
+  total_updated: number;
+  by_state: Record<string, { scraped: number; new: number; updated: number }>;
+  errors: { state: string; error: string }[];
+}
+
+export interface RunStageRequest {
+  stage: string;
+  hearing_ids: number[];
+}
+
+export interface RunStageResponse {
+  message: string;
+  stage: string;
+  queued_count: number;
+  skipped_count: number;
+  queued_ids: number[];
+  skipped_ids: number[];
+}
+
+// Docket Sources
+export async function getDocketSources(): Promise<DocketSource[]> {
+  return fetchAPI<DocketSource[]>('/admin/pipeline/docket-sources');
+}
+
+export async function toggleDocketSource(sourceId: number): Promise<{ enabled: boolean }> {
+  return fetchAPI(`/admin/pipeline/docket-sources/${sourceId}/toggle`, { method: 'POST' });
+}
+
+// Known Dockets
+export async function getKnownDockets(params?: {
+  state?: string;
+  sector?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<KnownDocket[]> {
+  const searchParams = new URLSearchParams();
+  if (params?.state) searchParams.set('state', params.state);
+  if (params?.sector) searchParams.set('sector', params.sector);
+  if (params?.search) searchParams.set('search', params.search);
+  if (params?.limit) searchParams.set('limit', params.limit.toString());
+  if (params?.offset) searchParams.set('offset', params.offset.toString());
+  const query = searchParams.toString() ? `?${searchParams.toString()}` : '';
+  return fetchAPI<KnownDocket[]>(`/admin/pipeline/known-dockets${query}`);
+}
+
+// Data Quality
+export async function getDataQuality(): Promise<DataQualityStats> {
+  return fetchAPI<DataQualityStats>('/admin/pipeline/data-quality');
+}
+
+// Extended Status (includes docket discovery info)
+export async function getExtendedPipelineStatus(): Promise<ExtendedPipelineStatus> {
+  return fetchAPI<ExtendedPipelineStatus>('/admin/pipeline/extended-status');
+}
+
+// Docket Discovery
+export async function startDocketDiscovery(request?: DocketDiscoveryRequest): Promise<DocketDiscoveryResponse> {
+  return fetchAPI<DocketDiscoveryResponse>('/admin/pipeline/docket-discovery/start', {
+    method: 'POST',
+    body: JSON.stringify(request || {}),
+  });
+}
+
+// Match Stage
+export async function startMatchStage(request?: { states?: string[]; max_hearings?: number }): Promise<{ message: string; hearings_queued: number }> {
+  return fetchAPI('/admin/pipeline/match/start', {
+    method: 'POST',
+    body: JSON.stringify(request || {}),
+  });
+}
+
+// Run Stage on Specific Hearings
+export async function runStageOnHearings(request: RunStageRequest): Promise<RunStageResponse> {
+  return fetchAPI<RunStageResponse>('/admin/pipeline/run-stage', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}

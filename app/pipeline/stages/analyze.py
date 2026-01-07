@@ -130,13 +130,6 @@ Produce a JSON analysis with this structure:
     }}
   ],
 
-  "dockets": [
-    {{
-      "number": "Docket number exactly as stated (e.g., 20250035-GU, case 18-1546)",
-      "context": "What this docket is about"
-    }}
-  ],
-
   "issues": [
     {{"issue": "Key issue", "description": "Brief description"}}
   ],
@@ -442,17 +435,21 @@ class AnalyzeStage(BaseStage):
     # ==================== Entity Linking Methods ====================
 
     def _link_entities(self, hearing: Hearing, analysis: Analysis, db: Session) -> dict:
-        """Link all extracted entities for a hearing with smart validation."""
-        # Clean up any previous links (for re-processing)
-        self._cleanup_previous_links(hearing, db)
+        """Link extracted topics and utilities for a hearing with smart validation.
+
+        Note: Docket extraction is handled separately by the SmartExtract stage
+        using regex patterns against known dockets for higher accuracy.
+        """
+        # Clean up previous topic and utility links (for re-processing)
+        # Note: We don't touch dockets - those are managed by SmartExtract stage
+        db.query(HearingTopic).filter(HearingTopic.hearing_id == hearing.id).delete()
+        db.query(HearingUtility).filter(HearingUtility.hearing_id == hearing.id).delete()
 
         stats = {
             'topics_linked': 0,
             'topics_created': 0,
             'utilities_linked': 0,
             'utilities_created': 0,
-            'dockets_linked': 0,
-            'dockets_created': 0,
             'needs_review': 0,
         }
 
@@ -464,12 +461,13 @@ class AnalyzeStage(BaseStage):
             'hearing_date': hearing.hearing_date.isoformat() if hearing.hearing_date else '',
         }
 
-        # Validate all entities through unified pipeline
+        # Validate topics and utilities through unified pipeline
+        # Note: Pass empty list for dockets - SmartExtract stage handles those
         validation_pipeline = EntityValidationPipeline(db)
         validated = validation_pipeline.validate_all(
             topics_extracted=analysis.topics_extracted or [],
             utilities_extracted=analysis.utilities_extracted or [],
-            dockets_extracted=analysis.dockets_extracted or [],
+            dockets_extracted=[],  # Dockets handled by SmartExtract stage
             hearing_context=hearing_context
         )
 
@@ -499,19 +497,8 @@ class AnalyzeStage(BaseStage):
                 if validated_utility.role == 'applicant' and not hearing.primary_utility_id:
                     hearing.primary_utility_id = utility.id
 
-        # Link dockets with validation results
-        for validated_docket in validated['dockets']:
-            docket, created = self._link_docket_validated(hearing, validated_docket, db)
-            if docket:
-                stats['dockets_linked'] += 1
-                if created:
-                    stats['dockets_created'] += 1
-                # All dockets need review per user requirement
-                stats['needs_review'] += 1
-
-        # Update hearing metadata
+        # Update hearing metadata (sector from analysis, dockets from SmartExtract)
         hearing.sector = analysis.sector
-        hearing.has_docket_references = stats['dockets_linked'] > 0
 
         db.commit()
 
@@ -519,7 +506,6 @@ class AnalyzeStage(BaseStage):
             f"Linked hearing {hearing.id}: "
             f"{stats['topics_linked']} topics ({stats['topics_created']} new), "
             f"{stats['utilities_linked']} utilities ({stats['utilities_created']} new), "
-            f"{stats['dockets_linked']} dockets ({stats['dockets_created']} new), "
             f"{stats['needs_review']} need review"
         )
 
@@ -635,7 +621,7 @@ class AnalyzeStage(BaseStage):
             sentiment=topic_data.get('sentiment'),
             context_summary=topic_data.get('context'),
             confidence='auto',
-            needs_review=(topic.category == 'uncategorized'),
+            needs_review=True,  # All topics require manual review
         )
         db.add(ht)
 
@@ -782,7 +768,7 @@ class AnalyzeStage(BaseStage):
             # Update with validation data
             existing.confidence_score = validated.confidence
             existing.match_type = validated.match_type
-            existing.needs_review = (validated.status == 'needs_review')
+            existing.needs_review = True  # All topics require manual review
             return
 
         relevance_map = {'high': 0.9, 'medium': 0.6, 'low': 0.3}
@@ -796,7 +782,7 @@ class AnalyzeStage(BaseStage):
             confidence=validated.match_type,  # exact, fuzzy, none
             confidence_score=validated.confidence,
             match_type=validated.match_type,
-            needs_review=(validated.status == 'needs_review'),
+            needs_review=True,  # All topics require manual review
             review_reason=validated.review_reason,
         )
         db.add(ht)
@@ -854,7 +840,7 @@ class AnalyzeStage(BaseStage):
             # Update with validation data
             existing.confidence_score = validated.confidence
             existing.match_type = validated.match_type
-            existing.needs_review = (validated.status == 'needs_review')
+            existing.needs_review = True  # All utilities require manual review
             return
 
         hu = HearingUtility(
@@ -865,7 +851,7 @@ class AnalyzeStage(BaseStage):
             confidence=validated.match_type,
             confidence_score=validated.confidence,
             match_type=validated.match_type,
-            needs_review=(validated.status == 'needs_review'),
+            needs_review=True,  # All utilities require manual review
             review_reason=validated.review_reason,
         )
         db.add(hu)

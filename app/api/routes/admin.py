@@ -4,6 +4,7 @@ Admin API routes for pipeline monitoring and management.
 from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 
@@ -197,18 +198,25 @@ def toggle_source(source_id: int, db: Session = Depends(get_db)):
 # HEARINGS (ADMIN VIEW)
 # ============================================================================
 
-@router.get("/hearings", response_model=List[HearingWithPipeline])
+class HearingsResponse(BaseModel):
+    items: List[HearingWithPipeline]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+@router.get("/hearings")
 def list_hearings_admin(
     states: Optional[str] = Query(None, description="Comma-separated state codes"),
     status: Optional[str] = None,
-    pipeline_status: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
     db: Session = Depends(get_db)
 ):
-    """List hearings with full pipeline status for admin dashboard."""
+    """List hearings with pipeline status for admin dashboard."""
     query = db.query(
         Hearing,
         State.code.label("state_code"),
@@ -220,11 +228,47 @@ def list_hearings_admin(
         state_list = [s.strip().upper() for s in states.split(",")]
         query = query.filter(State.code.in_(state_list))
     if status:
-        query = query.filter(Hearing.status == status)
+        if status == 'review':
+            # Hearings in smart_extracted with pending review entities
+            from app.models.database import HearingTopic, HearingUtility, HearingDocket
+            query = query.filter(
+                Hearing.status == 'smart_extracted',
+                or_(
+                    Hearing.id.in_(
+                        db.query(HearingTopic.hearing_id).filter(HearingTopic.needs_review == True)
+                    ),
+                    Hearing.id.in_(
+                        db.query(HearingUtility.hearing_id).filter(HearingUtility.needs_review == True)
+                    ),
+                    Hearing.id.in_(
+                        db.query(HearingDocket.hearing_id).filter(HearingDocket.needs_review == True)
+                    ),
+                )
+            )
+        elif status == 'ready_for_extract':
+            # Hearings in smart_extracted WITHOUT pending review entities
+            from app.models.database import HearingTopic, HearingUtility, HearingDocket
+            query = query.filter(
+                Hearing.status == 'smart_extracted',
+                ~Hearing.id.in_(
+                    db.query(HearingTopic.hearing_id).filter(HearingTopic.needs_review == True)
+                ),
+                ~Hearing.id.in_(
+                    db.query(HearingUtility.hearing_id).filter(HearingUtility.needs_review == True)
+                ),
+                ~Hearing.id.in_(
+                    db.query(HearingDocket.hearing_id).filter(HearingDocket.needs_review == True)
+                ),
+            )
+        else:
+            query = query.filter(Hearing.status == status)
     if date_from:
         query = query.filter(Hearing.hearing_date >= date_from)
     if date_to:
         query = query.filter(Hearing.hearing_date <= date_to)
+
+    # Get total count before pagination
+    total = query.count()
 
     # Order by most recent first
     query = query.order_by(Hearing.created_at.desc())
@@ -233,53 +277,9 @@ def list_hearings_admin(
     offset = (page - 1) * page_size
     results = query.offset(offset).limit(page_size).all()
 
-    # Fetch pipeline jobs for each hearing
-    hearing_ids = [r.Hearing.id for r in results]
-    pipeline_jobs = db.query(PipelineJob).filter(
-        PipelineJob.hearing_id.in_(hearing_ids)
-    ).all()
-
-    # Group jobs by hearing
-    jobs_by_hearing = {}
-    for job in pipeline_jobs:
-        if job.hearing_id not in jobs_by_hearing:
-            jobs_by_hearing[job.hearing_id] = []
-        jobs_by_hearing[job.hearing_id].append(job)
-
-    # Calculate pipeline status for each hearing
-    def get_pipeline_status(jobs):
-        if not jobs:
-            return "discovered"
-        stages = {j.stage: j.status for j in jobs}
-        if any(s == "error" for s in stages.values()):
-            return "error"
-        if any(s == "running" for s in stages.values()):
-            if stages.get("download") == "running":
-                return "downloading"
-            if stages.get("transcribe") == "running":
-                return "transcribing"
-            if stages.get("analyze") == "running":
-                return "analyzing"
-        if all(s == "complete" for s in stages.values()) and len(stages) == 3:
-            return "complete"
-        if stages.get("analyze") == "complete":
-            return "complete"
-        if stages.get("transcribe") == "complete":
-            return "analyzing"
-        if stages.get("download") == "complete":
-            return "transcribing"
-        return "discovered"
-
-    # Filter by pipeline status if requested
-    response = []
-    for r in results:
-        jobs = jobs_by_hearing.get(r.Hearing.id, [])
-        p_status = get_pipeline_status(jobs)
-
-        if pipeline_status and p_status != pipeline_status:
-            continue
-
-        response.append(HearingWithPipeline(
+    # Build response using Hearing.status directly
+    items = [
+        HearingWithPipeline(
             id=r.Hearing.id,
             state_code=r.state_code,
             state_name=r.state_name,
@@ -291,24 +291,21 @@ def list_hearings_admin(
             status=r.Hearing.status,
             source_url=r.Hearing.source_url,
             created_at=r.Hearing.created_at,
-            pipeline_status=p_status,
-            pipeline_jobs=[
-                PipelineJobResponse(
-                    id=j.id,
-                    hearing_id=j.hearing_id,
-                    stage=j.stage,
-                    status=j.status,
-                    started_at=j.started_at,
-                    completed_at=j.completed_at,
-                    error_message=j.error_message,
-                    retry_count=j.retry_count,
-                    cost_usd=float(j.cost_usd) if j.cost_usd else None
-                )
-                for j in jobs
-            ]
-        ))
+            pipeline_status=r.Hearing.status,  # Use Hearing.status directly
+            pipeline_jobs=[]
+        )
+        for r in results
+    ]
 
-    return response
+    total_pages = (total + page_size - 1) // page_size
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages
+    }
 
 
 @router.post("/hearings/{hearing_id}/retry")
@@ -442,7 +439,7 @@ def get_admin_stats(db: Session = Depends(get_db)):
     month_start = today_start - timedelta(days=30)
 
     # Basic counts
-    total_states = db.query(func.count(State.id)).scalar()
+    total_states = db.query(func.count(func.distinct(Hearing.state_id))).scalar()  # Only states with hearings
     total_sources = db.query(func.count(Source.id)).scalar()
     total_hearings = db.query(func.count(Hearing.id)).scalar()
     total_segments = db.query(func.count(Segment.id)).scalar()
@@ -465,8 +462,8 @@ def get_admin_stats(db: Session = Depends(get_db)):
     ).join(Hearing).group_by(State.code).all()
     hearings_by_state = {s: c for s, c in state_counts}
 
-    # Source health
-    sources_healthy = db.query(func.count(Source.id)).filter(Source.status == "healthy").scalar()
+    # Source health (sources use "active" status, not "healthy")
+    sources_healthy = db.query(func.count(Source.id)).filter(Source.status == "active").scalar()
     sources_error = db.query(func.count(Source.id)).filter(Source.status == "error").scalar()
 
     # Pipeline jobs
@@ -482,9 +479,9 @@ def get_admin_stats(db: Session = Depends(get_db)):
         PipelineJob.stage == "analyze"
     ).scalar() or 0
 
-    # Costs by period
+    # Costs by period (use last 24 hours to avoid timezone issues)
     cost_today = db.query(func.sum(PipelineJob.cost_usd)).filter(
-        PipelineJob.completed_at >= today_start
+        PipelineJob.completed_at >= now - timedelta(hours=24)
     ).scalar() or 0
     cost_week = db.query(func.sum(PipelineJob.cost_usd)).filter(
         PipelineJob.completed_at >= week_start
@@ -542,7 +539,21 @@ except ImportError:
 def get_scraper_status():
     """Get current scraper status and progress."""
     if not SCRAPER_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Scraper module not available in this deployment")
+        # Return idle status instead of error for better frontend handling
+        return {
+            "status": "unavailable",
+            "started_at": None,
+            "finished_at": None,
+            "current_scraper_type": None,
+            "current_source_name": None,
+            "current_source_index": 0,
+            "total_sources": 0,
+            "sources_completed": 0,
+            "items_found": 0,
+            "new_hearings": 0,
+            "existing_hearings": 0,
+            "errors": [],
+        }
     orchestrator = get_orchestrator()
     return orchestrator.get_progress()
 

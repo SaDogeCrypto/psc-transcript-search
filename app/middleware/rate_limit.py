@@ -57,14 +57,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return False, remaining - 1
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        # Skip rate limiting for health checks
-        if request.url.path in ["/health", "/", "/docs", "/redoc", "/openapi.json"]:
+        # Skip rate limiting for health checks, admin endpoints, and localhost
+        skip_paths = ["/health", "/", "/docs", "/redoc", "/openapi.json"]
+        client_host = request.client.host if request.client else ""
+        is_localhost = client_host in ["127.0.0.1", "localhost", "::1"]
+
+        if request.url.path in skip_paths or request.url.path.startswith("/admin") or is_localhost:
             return await call_next(request)
 
         client_id = self._get_client_id(request)
         is_limited, remaining = self._is_rate_limited(client_id)
 
         if is_limited:
+            # Include CORS headers in rate limit response
+            origin = request.headers.get("origin", "*")
             return JSONResponse(
                 status_code=429,
                 content={
@@ -77,6 +83,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     "X-RateLimit-Remaining": "0",
                     "X-RateLimit-Reset": str(int(time.time()) + self.window_size),
                     "Retry-After": str(self.window_size),
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Credentials": "true",
                 },
             )
 

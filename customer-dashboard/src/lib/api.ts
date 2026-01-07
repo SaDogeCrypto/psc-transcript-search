@@ -377,3 +377,42 @@ export async function searchDockets(q: string, states?: string): Promise<{ resul
 export async function getDocketByNormalizedId(normalizedId: string): Promise<DocketWithTimeline> {
   return fetchAPI(`/api/dockets/by-normalized-id/${normalizedId}`)
 }
+
+// Suggestions / Quick Add Types
+export interface TrendingDocket {
+  id: number
+  docket_id: string  // normalized_id like "FL-20250035"
+  utility_name?: string
+  mention_count: number
+  state: string
+  already_watching: boolean
+}
+
+export interface UtilitySuggestion {
+  utility_name: string
+  states: string[]
+  active_docket_count: number
+  already_following: boolean
+}
+
+export interface SuggestionsResponse {
+  trending: TrendingDocket[]
+  utilities: UtilitySuggestion[]
+}
+
+export interface FollowUtilityResponse {
+  added_count: number
+  docket_ids: string[]
+}
+
+// Suggestions / Quick Add API
+export async function getSuggestions(userId: number = 1): Promise<SuggestionsResponse> {
+  return fetchAPI(`/api/suggestions?user_id=${userId}`)
+}
+
+export async function followUtility(utilityName: string, userId: number = 1): Promise<FollowUtilityResponse> {
+  return fetchAPI(`/api/watchlist/follow-utility?user_id=${userId}`, {
+    method: 'POST',
+    body: JSON.stringify({ utility_name: utilityName }),
+  })
+}

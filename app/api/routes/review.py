@@ -56,7 +56,7 @@ class ReviewItem(BaseModel):
 
 
 class ReviewAction(BaseModel):
-    action: str  # "link", "correct", "invalid", "skip"
+    action: str  # "approve", "link", "correct", "invalid", "skip", "reject"
     correct_entity_id: Optional[int] = None
     corrected_text: Optional[str] = None
     notes: Optional[str] = None
@@ -67,6 +67,58 @@ class ReviewQueueStats(BaseModel):
     dockets: int
     topics: int
     utilities: int
+    hearings: int = 0  # Number of unique hearings with items needing review
+
+
+# =============================================================================
+# HEARING-GROUPED REVIEW SCHEMAS
+# =============================================================================
+
+class EntityReviewItem(BaseModel):
+    """Single entity within a hearing review."""
+    id: int
+    entity_type: str  # topic, utility, docket
+    entity_id: int
+    name: str
+    role: Optional[str] = None  # For utilities: applicant, intervenor, subject
+    category: Optional[str] = None  # For topics
+    context: Optional[str] = None
+    confidence: str
+    confidence_score: Optional[int] = None
+    match_type: Optional[str] = None
+    review_reason: Optional[str] = None
+    # For dockets
+    known_docket_id: Optional[int] = None
+    known_utility: Optional[str] = None
+    known_title: Optional[str] = None
+    utility_match: bool = False  # True if docket utility matches extracted utilities
+    suggestions: List[ReviewSuggestion] = []
+
+
+class HearingReviewItem(BaseModel):
+    """All entities for a single hearing grouped together."""
+    hearing_id: int
+    hearing_title: str
+    hearing_date: Optional[str] = None
+    state_code: Optional[str] = None
+    # Grouped entities
+    topics: List[EntityReviewItem] = []
+    utilities: List[EntityReviewItem] = []
+    dockets: List[EntityReviewItem] = []
+    # Summary stats
+    total_entities: int = 0
+    needs_review_count: int = 0
+    lowest_confidence: Optional[int] = None
+    # Cross-entity validation
+    utility_docket_matches: int = 0  # How many dockets have matching utilities
+
+
+class BulkReviewAction(BaseModel):
+    """Bulk action on multiple entities."""
+    action: str  # "approve_all", "approve_high_confidence", "reject_low_confidence"
+    confidence_threshold: int = 80  # For threshold-based actions
+    entity_ids: Optional[List[dict]] = None  # For selective: [{"type": "topic", "id": 123}, ...]
+    notes: Optional[str] = None
 
 
 # =============================================================================
@@ -194,12 +246,389 @@ def get_review_stats(db: Session = Depends(get_db)) -> ReviewQueueStats:
         HearingUtility.needs_review == True
     ).count()
 
+    # Count unique hearings with items needing review
+    hearing_ids = set()
+    for (hid,) in db.query(HearingDocket.hearing_id).filter(HearingDocket.needs_review == True).all():
+        hearing_ids.add(hid)
+    for (hid,) in db.query(HearingTopic.hearing_id).filter(HearingTopic.needs_review == True).all():
+        hearing_ids.add(hid)
+    for (hid,) in db.query(HearingUtility.hearing_id).filter(HearingUtility.needs_review == True).all():
+        hearing_ids.add(hid)
+
     return ReviewQueueStats(
         total=docket_count + topic_count + utility_count,
         dockets=docket_count,
         topics=topic_count,
-        utilities=utility_count
+        utilities=utility_count,
+        hearings=len(hearing_ids)
     )
+
+
+@router.get("/hearings")
+def get_hearing_review_queue(
+    state: Optional[str] = Query(None, description="Filter by state code"),
+    limit: int = Query(20, le=50, description="Max hearings to return"),
+    db: Session = Depends(get_db)
+) -> List[HearingReviewItem]:
+    """
+    Get review items grouped by hearing.
+    Returns all entities for each hearing together for contextual review.
+    """
+    from app.models.database import (
+        Hearing, State,
+        HearingTopic, Topic,
+        HearingUtility, Utility,
+        HearingDocket, Docket, KnownDocket
+    )
+
+    # Find hearings with items needing review
+    # Get hearing IDs from all entity types
+    hearing_ids_with_review = set()
+
+    # From dockets
+    docket_query = db.query(HearingDocket.hearing_id).filter(
+        HearingDocket.needs_review == True
+    )
+    if state:
+        docket_query = docket_query.join(Hearing).join(State).filter(State.code == state.upper())
+    for (hid,) in docket_query.all():
+        hearing_ids_with_review.add(hid)
+
+    # From topics
+    topic_query = db.query(HearingTopic.hearing_id).filter(
+        HearingTopic.needs_review == True
+    )
+    if state:
+        topic_query = topic_query.join(Hearing).join(State).filter(State.code == state.upper())
+    for (hid,) in topic_query.all():
+        hearing_ids_with_review.add(hid)
+
+    # From utilities
+    utility_query = db.query(HearingUtility.hearing_id).filter(
+        HearingUtility.needs_review == True
+    )
+    if state:
+        utility_query = utility_query.join(Hearing).join(State).filter(State.code == state.upper())
+    for (hid,) in utility_query.all():
+        hearing_ids_with_review.add(hid)
+
+    if not hearing_ids_with_review:
+        return []
+
+    # Get hearing details
+    hearings = db.query(Hearing, State).join(
+        State, Hearing.state_id == State.id
+    ).filter(
+        Hearing.id.in_(hearing_ids_with_review)
+    ).order_by(Hearing.hearing_date.desc()).limit(limit).all()
+
+    results = []
+
+    for hearing, hearing_state in hearings:
+        item = HearingReviewItem(
+            hearing_id=hearing.id,
+            hearing_title=hearing.title[:150] if hearing.title else "",
+            hearing_date=str(hearing.hearing_date) if hearing.hearing_date else None,
+            state_code=hearing_state.code,
+        )
+
+        # Collect utility names for cross-validation
+        utility_names = set()
+
+        # Get topics for this hearing
+        topics = db.query(HearingTopic, Topic).join(
+            Topic, HearingTopic.topic_id == Topic.id
+        ).filter(
+            HearingTopic.hearing_id == hearing.id,
+            HearingTopic.needs_review == True
+        ).all()
+
+        for ht, topic in topics:
+            suggestions = get_topic_suggestions(db, topic.name)
+            item.topics.append(EntityReviewItem(
+                id=ht.id,
+                entity_type="topic",
+                entity_id=topic.id,
+                name=topic.name,
+                category=topic.category,
+                context=ht.context_summary,
+                confidence=ht.confidence or "auto",
+                confidence_score=ht.confidence_score,
+                match_type=ht.match_type,
+                review_reason=ht.review_reason,
+                suggestions=[ReviewSuggestion(**s) for s in suggestions]
+            ))
+
+        # Get utilities for this hearing
+        utilities = db.query(HearingUtility, Utility).join(
+            Utility, HearingUtility.utility_id == Utility.id
+        ).filter(
+            HearingUtility.hearing_id == hearing.id,
+            HearingUtility.needs_review == True
+        ).all()
+
+        for hu, utility in utilities:
+            utility_names.add(utility.name.lower())
+            if utility.normalized_name:
+                utility_names.add(utility.normalized_name.lower())
+            for alias in (utility.aliases or []):
+                utility_names.add(alias.lower())
+
+            suggestions = get_utility_suggestions(db, utility.name)
+            item.utilities.append(EntityReviewItem(
+                id=hu.id,
+                entity_type="utility",
+                entity_id=utility.id,
+                name=utility.name,
+                role=hu.role,
+                context=hu.context_summary,
+                confidence=hu.confidence or "auto",
+                confidence_score=hu.confidence_score,
+                match_type=hu.match_type,
+                review_reason=hu.review_reason,
+                suggestions=[ReviewSuggestion(**s) for s in suggestions]
+            ))
+
+        # Get dockets for this hearing
+        dockets = db.query(HearingDocket, Docket).join(
+            Docket, HearingDocket.docket_id == Docket.id
+        ).filter(
+            HearingDocket.hearing_id == hearing.id,
+            HearingDocket.needs_review == True
+        ).all()
+
+        for hd, docket in dockets:
+            # Get known docket info
+            known_utility = None
+            known_title = None
+            if docket.known_docket_id:
+                known = db.query(KnownDocket).filter(KnownDocket.id == docket.known_docket_id).first()
+                if known:
+                    known_utility = known.utility_name
+                    known_title = known.title
+
+            # Check if docket utility matches extracted utilities
+            utility_match = False
+            if known_utility:
+                if known_utility.lower() in utility_names:
+                    utility_match = True
+                else:
+                    # Fuzzy check
+                    for uname in utility_names:
+                        if known_utility.lower() in uname or uname in known_utility.lower():
+                            utility_match = True
+                            break
+
+            if utility_match:
+                item.utility_docket_matches += 1
+
+            suggestions = get_docket_suggestions(db, docket.docket_number, hearing_state.code)
+            item.dockets.append(EntityReviewItem(
+                id=hd.docket_id,  # Use docket_id since HearingDocket has composite key
+                entity_type="docket",
+                entity_id=docket.id,
+                name=docket.docket_number,
+                context=hd.context_summary,
+                confidence=docket.confidence or "unverified",
+                confidence_score=hd.confidence_score,
+                match_type=hd.match_type,
+                review_reason=hd.review_reason,
+                known_docket_id=docket.known_docket_id,
+                known_utility=known_utility,
+                known_title=known_title,
+                utility_match=utility_match,
+                suggestions=[ReviewSuggestion(**s) for s in suggestions]
+            ))
+
+        # Calculate summary stats
+        item.total_entities = len(item.topics) + len(item.utilities) + len(item.dockets)
+        item.needs_review_count = item.total_entities  # All are needs_review since we filtered
+
+        # Find lowest confidence
+        all_scores = []
+        for t in item.topics:
+            if t.confidence_score is not None:
+                all_scores.append(t.confidence_score)
+        for u in item.utilities:
+            if u.confidence_score is not None:
+                all_scores.append(u.confidence_score)
+        for d in item.dockets:
+            if d.confidence_score is not None:
+                all_scores.append(d.confidence_score)
+
+        if all_scores:
+            item.lowest_confidence = min(all_scores)
+
+        results.append(item)
+
+    return results
+
+
+@router.post("/hearings/{hearing_id}/bulk")
+def bulk_review_hearing(
+    hearing_id: int,
+    action: BulkReviewAction,
+    db: Session = Depends(get_db)
+):
+    """
+    Bulk approve/reject entities for a hearing.
+    Actions:
+    - approve_all: Approve all entities
+    - approve_high_confidence: Approve entities above threshold
+    - reject_all: Reject all entities
+    """
+    from app.models.database import HearingTopic, HearingUtility, HearingDocket, Docket
+
+    approved = 0
+    rejected = 0
+
+    if action.action == "approve_all":
+        # Approve all topics
+        topics = db.query(HearingTopic).filter(
+            HearingTopic.hearing_id == hearing_id,
+            HearingTopic.needs_review == True
+        ).all()
+        for ht in topics:
+            ht.needs_review = False
+            ht.confidence = "verified"
+            ht.review_notes = action.notes or "Bulk approved"
+            approved += 1
+
+        # Approve all utilities
+        utilities = db.query(HearingUtility).filter(
+            HearingUtility.hearing_id == hearing_id,
+            HearingUtility.needs_review == True
+        ).all()
+        for hu in utilities:
+            hu.needs_review = False
+            hu.confidence = "verified"
+            hu.review_notes = action.notes or "Bulk approved"
+            approved += 1
+
+        # Approve all dockets
+        dockets = db.query(HearingDocket).filter(
+            HearingDocket.hearing_id == hearing_id,
+            HearingDocket.needs_review == True
+        ).all()
+        for hd in dockets:
+            hd.needs_review = False
+            hd.review_notes = action.notes or "Bulk approved"
+            # Also update docket confidence
+            docket = db.query(Docket).filter(Docket.id == hd.docket_id).first()
+            if docket:
+                docket.confidence = "verified"
+                docket.review_status = "reviewed"
+            approved += 1
+
+    elif action.action == "approve_high_confidence":
+        threshold = action.confidence_threshold
+
+        # Topics
+        topics = db.query(HearingTopic).filter(
+            HearingTopic.hearing_id == hearing_id,
+            HearingTopic.needs_review == True,
+            HearingTopic.confidence_score >= threshold
+        ).all()
+        for ht in topics:
+            ht.needs_review = False
+            ht.confidence = "verified"
+            ht.review_notes = f"Auto-approved (score >= {threshold})"
+            approved += 1
+
+        # Utilities
+        utilities = db.query(HearingUtility).filter(
+            HearingUtility.hearing_id == hearing_id,
+            HearingUtility.needs_review == True,
+            HearingUtility.confidence_score >= threshold
+        ).all()
+        for hu in utilities:
+            hu.needs_review = False
+            hu.confidence = "verified"
+            hu.review_notes = f"Auto-approved (score >= {threshold})"
+            approved += 1
+
+        # Dockets
+        dockets = db.query(HearingDocket).filter(
+            HearingDocket.hearing_id == hearing_id,
+            HearingDocket.needs_review == True,
+            HearingDocket.confidence_score >= threshold
+        ).all()
+        for hd in dockets:
+            hd.needs_review = False
+            hd.review_notes = f"Auto-approved (score >= {threshold})"
+            docket = db.query(Docket).filter(Docket.id == hd.docket_id).first()
+            if docket:
+                docket.confidence = "verified"
+                docket.review_status = "reviewed"
+            approved += 1
+
+    elif action.action == "reject_all":
+        # Delete all entity links
+        db.query(HearingTopic).filter(
+            HearingTopic.hearing_id == hearing_id,
+            HearingTopic.needs_review == True
+        ).delete()
+
+        db.query(HearingUtility).filter(
+            HearingUtility.hearing_id == hearing_id,
+            HearingUtility.needs_review == True
+        ).delete()
+
+        dockets = db.query(HearingDocket).filter(
+            HearingDocket.hearing_id == hearing_id,
+            HearingDocket.needs_review == True
+        ).all()
+        for hd in dockets:
+            docket = db.query(Docket).filter(Docket.id == hd.docket_id).first()
+            if docket:
+                docket.review_status = "rejected"
+            rejected += 1
+        db.query(HearingDocket).filter(
+            HearingDocket.hearing_id == hearing_id,
+            HearingDocket.needs_review == True
+        ).delete()
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action.action}")
+
+    # Check if all entities for this hearing have been reviewed
+    # If so, advance the hearing to the next pipeline stage
+    from app.models.database import Hearing
+
+    # Flush to ensure our changes are visible in subsequent queries
+    db.flush()
+
+    remaining_topics = db.query(HearingTopic).filter(
+        HearingTopic.hearing_id == hearing_id,
+        HearingTopic.needs_review == True
+    ).count()
+
+    remaining_utilities = db.query(HearingUtility).filter(
+        HearingUtility.hearing_id == hearing_id,
+        HearingUtility.needs_review == True
+    ).count()
+
+    remaining_dockets = db.query(HearingDocket).filter(
+        HearingDocket.hearing_id == hearing_id,
+        HearingDocket.needs_review == True
+    ).count()
+
+    hearing_advanced = False
+    if remaining_topics == 0 and remaining_utilities == 0 and remaining_dockets == 0:
+        # All entities reviewed - advance hearing to smart_extracted for Extract stage
+        hearing = db.query(Hearing).filter(Hearing.id == hearing_id).first()
+        if hearing and hearing.status in ('analyzed', 'smart_extracting', 'smart_extracted'):
+            hearing.status = 'smart_extracted'
+            hearing_advanced = True
+
+    db.commit()
+
+    return {
+        "message": f"Bulk review complete",
+        "approved": approved,
+        "rejected": rejected,
+        "hearing_advanced": hearing_advanced
+    }
 
 
 @router.get("/queue")
@@ -379,7 +808,23 @@ def review_docket(
     # Store original for correction tracking
     original_text = docket.docket_number
 
-    if action.action == "link":
+    if action.action == "approve":
+        # Approve the docket as-is
+        docket.confidence = "verified"
+        docket.review_status = "reviewed"
+        # Also update any HearingDocket records
+        for hd in docket.hearing_dockets:
+            hd.needs_review = False
+
+    elif action.action == "reject" or action.action == "invalid":
+        # Mark as not a real docket
+        docket.review_status = "invalid"
+        docket.confidence = "invalid"
+        # Also update any HearingDocket records
+        for hd in docket.hearing_dockets:
+            hd.needs_review = False
+
+    elif action.action == "link":
         # Link to a known docket
         if not action.correct_entity_id:
             raise HTTPException(status_code=400, detail="correct_entity_id required for link action")
@@ -402,6 +847,10 @@ def review_docket(
         if known.title and not docket.title:
             docket.title = known.title
 
+        # Also update any HearingDocket records
+        for hd in docket.hearing_dockets:
+            hd.needs_review = False
+
     elif action.action == "correct":
         # Fix the docket number
         if not action.corrected_text:
@@ -410,11 +859,9 @@ def review_docket(
         docket.original_extracted = original_text
         docket.docket_number = action.corrected_text
         docket.review_status = "reviewed"
-
-    elif action.action == "invalid":
-        # Mark as not a real docket
-        docket.review_status = "invalid"
-        docket.confidence = "invalid"
+        # Also update any HearingDocket records
+        for hd in docket.hearing_dockets:
+            hd.needs_review = False
 
     elif action.action == "skip":
         # Skip for now
@@ -450,6 +897,87 @@ def review_docket(
     return {"message": "Review processed", "new_confidence": docket.confidence}
 
 
+@router.post("/hearing_docket/{hearing_id}/{docket_id}")
+def review_hearing_docket(
+    hearing_id: int,
+    docket_id: int,
+    action: ReviewAction,
+    db: Session = Depends(get_db)
+):
+    """Process review action for a hearing_docket link (approve/reject/link individual entity)."""
+    from app.models.database import HearingDocket, Docket, KnownDocket, EntityCorrection
+
+    # HearingDocket uses composite key (hearing_id, docket_id)
+    hd = db.query(HearingDocket).filter(
+        HearingDocket.hearing_id == hearing_id,
+        HearingDocket.docket_id == docket_id
+    ).first()
+    if not hd:
+        raise HTTPException(status_code=404, detail="HearingDocket not found")
+
+    docket = db.query(Docket).filter(Docket.id == hd.docket_id).first()
+    original_text = docket.docket_number if docket else ""
+
+    if action.action == "approve":
+        # Approve this hearing-docket link
+        hd.needs_review = False
+        if docket:
+            docket.confidence = "verified"
+            docket.review_status = "reviewed"
+
+    elif action.action == "link":
+        # Link to a known docket
+        if not action.correct_entity_id:
+            raise HTTPException(status_code=400, detail="correct_entity_id required for link action")
+
+        known = db.query(KnownDocket).filter(KnownDocket.id == action.correct_entity_id).first()
+        if not known:
+            raise HTTPException(status_code=404, detail="Known docket not found")
+
+        # Update the docket with the known docket info
+        if docket:
+            docket.known_docket_id = known.id
+            docket.confidence = "verified"
+            docket.review_status = "reviewed"
+            # Copy metadata from known docket
+            if known.utility_name:
+                docket.company = known.utility_name
+            if known.sector:
+                docket.sector = known.sector
+            if known.title:
+                docket.title = known.title
+
+        hd.needs_review = False
+
+    elif action.action == "reject" or action.action == "invalid":
+        # Remove this hearing-docket link
+        db.delete(hd)
+
+    elif action.action == "skip":
+        pass
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action.action}")
+
+    # Record correction
+    if action.action in ("reject", "invalid", "link"):
+        correction = EntityCorrection(
+            entity_type="docket",
+            hearing_id=hd.hearing_id,
+            original_text=original_text,
+            corrected_text=action.corrected_text,
+            correct_entity_id=action.correct_entity_id,
+            correction_type=action.action,
+            created_by="admin",
+        )
+        db.add(correction)
+
+    hd.review_notes = action.notes
+    db.commit()
+
+    return {"message": "Review processed"}
+
+
 @router.post("/topic/{hearing_topic_id}")
 def review_topic(
     hearing_topic_id: int,
@@ -466,7 +994,16 @@ def review_topic(
     topic = db.query(Topic).filter(Topic.id == ht.topic_id).first()
     original_text = topic.name if topic else ""
 
-    if action.action == "link":
+    if action.action == "approve":
+        # Approve the topic as-is
+        ht.confidence = "verified"
+        ht.needs_review = False
+
+    elif action.action == "reject" or action.action == "invalid":
+        # Remove the topic link
+        db.delete(ht)
+
+    elif action.action == "link":
         # Link to a different topic
         if not action.correct_entity_id:
             raise HTTPException(status_code=400, detail="correct_entity_id required for link action")
@@ -492,10 +1029,6 @@ def review_topic(
             topic.category = action.corrected_text
         ht.confidence = "verified"
         ht.needs_review = False
-
-    elif action.action == "invalid":
-        # Remove the topic link
-        db.delete(ht)
 
     elif action.action == "skip":
         pass
@@ -538,7 +1071,16 @@ def review_utility(
     utility = db.query(Utility).filter(Utility.id == hu.utility_id).first()
     original_text = utility.name if utility else ""
 
-    if action.action == "link":
+    if action.action == "approve":
+        # Approve the utility as-is
+        hu.confidence = "verified"
+        hu.needs_review = False
+
+    elif action.action == "reject" or action.action == "invalid":
+        # Remove the utility link
+        db.delete(hu)
+
+    elif action.action == "link":
         # Link to a different utility
         if not action.correct_entity_id:
             raise HTTPException(status_code=400, detail="correct_entity_id required for link action")
@@ -568,10 +1110,6 @@ def review_utility(
             utility.name = action.corrected_text
         hu.confidence = "verified"
         hu.needs_review = False
-
-    elif action.action == "invalid":
-        # Remove the utility link
-        db.delete(hu)
 
     elif action.action == "skip":
         pass

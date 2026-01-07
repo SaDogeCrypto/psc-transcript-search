@@ -85,6 +85,8 @@ class ValidatedUtility(ValidatedEntity):
     role: str = "subject"  # applicant, intervenor, subject
     aliases: List[str] = field(default_factory=list)
     utility_type: Optional[str] = None  # IOU, cooperative, municipal
+    sector: Optional[str] = None  # Electric, Gas, Water, Telephone
+    from_docket_metadata: bool = False  # True if matched via docket utility_name
 
 
 @dataclass
@@ -95,10 +97,17 @@ class ValidatedDocket(ValidatedEntity):
     format_valid: bool = False
     format_issues: List[str] = field(default_factory=list)
     year: Optional[int] = None
-    sector: Optional[str] = None
-    # Enrichment from known docket
+    sector: Optional[str] = None  # Electric, Gas, Water from docket ID parsing
+    # Enrichment from known docket metadata
     known_title: Optional[str] = None
     known_utility: Optional[str] = None
+    known_utility_type: Optional[str] = None  # Electric, Gas, Water, Telephone
+    known_docket_type: Optional[str] = None  # Rate Case, Merger, Certificate, etc.
+    known_status: Optional[str] = None  # open, closed, pending
+    known_filing_date: Optional[str] = None
+    # Context validation results
+    utility_context_match: bool = False  # True if docket utility matches hearing utility mentions
+    type_context_match: bool = False  # True if docket_type matches hearing context
 
 
 # =============================================================================
@@ -359,32 +368,52 @@ class UtilityValidator(EntityValidator):
         self._load_known_utilities()
 
     def _load_known_utilities(self):
-        """Load known utilities into cache."""
+        """Load known utilities into cache, including from docket metadata."""
         from app.models.database import Utility, KnownDocket
 
         # Load from utilities table
         utilities = self.db.query(Utility).all()
         utility_names = {}
         for u in utilities:
-            utility_names[u.name.lower()] = u
-            utility_names[u.normalized_name] = u
+            utility_names[u.name.lower()] = {'entity': u, 'source': 'utility'}
+            utility_names[u.normalized_name] = {'entity': u, 'source': 'utility'}
             for alias in (u.aliases or []):
-                utility_names[alias.lower()] = u
+                utility_names[alias.lower()] = {'entity': u, 'source': 'utility'}
 
-        # Also load utility names from known dockets
-        docket_utilities = self.db.query(KnownDocket.utility_name).filter(
+        # Load utility names + metadata from known dockets
+        docket_utilities = self.db.query(
+            KnownDocket.utility_name,
+            KnownDocket.utility_type,
+            KnownDocket.state_code
+        ).filter(
             KnownDocket.utility_name.isnot(None)
         ).distinct().all()
 
         known_utility_names = set(u.name for u in utilities)
-        for (name,) in docket_utilities:
+        utility_metadata = {}  # utility_name -> {utility_type, states}
+
+        for name, utility_type, state_code in docket_utilities:
             if name and name.strip():
-                known_utility_names.add(name.strip())
+                clean_name = name.strip()
+                known_utility_names.add(clean_name)
+
+                # Track metadata
+                if clean_name not in utility_metadata:
+                    utility_metadata[clean_name] = {
+                        'utility_type': utility_type,
+                        'states': set(),
+                    }
+                if state_code:
+                    utility_metadata[clean_name]['states'].add(state_code)
+                # Update utility_type if we get a more specific one
+                if utility_type and not utility_metadata[clean_name]['utility_type']:
+                    utility_metadata[clean_name]['utility_type'] = utility_type
 
         self._cache = {
             'by_name': utility_names,
             'names': list(known_utility_names),
             'utilities': {u.id: u for u in utilities},
+            'docket_metadata': utility_metadata,  # Metadata from known dockets
         }
 
     def validate(self, entity_data: Dict[str, Any], hearing_context: Dict[str, Any]) -> ValidatedUtility:
@@ -393,6 +422,7 @@ class UtilityValidator(EntityValidator):
         context = entity_data.get('context', '')
         role = entity_data.get('role', 'subject')
         aliases = entity_data.get('aliases', [])
+        state_code = hearing_context.get('state_code', '')
 
         normalized = slugify(name)
 
@@ -404,9 +434,10 @@ class UtilityValidator(EntityValidator):
             aliases=aliases,
         )
 
-        # Check for exact match
+        # Check for exact match in utilities table
         if name.lower() in self._cache['by_name']:
-            known = self._cache['by_name'][name.lower()]
+            cached = self._cache['by_name'][name.lower()]
+            known = cached['entity']
             result.match_type = "exact"
             result.matched_id = known.id
             result.matched_name = known.name
@@ -414,7 +445,8 @@ class UtilityValidator(EntityValidator):
             result.utility_type = known.utility_type
             result.is_new = False
         elif normalized in self._cache['by_name']:
-            known = self._cache['by_name'][normalized]
+            cached = self._cache['by_name'][normalized]
+            known = cached['entity']
             result.match_type = "exact"
             result.matched_id = known.id
             result.matched_name = known.name
@@ -425,7 +457,8 @@ class UtilityValidator(EntityValidator):
             # Check aliases
             for alias in aliases:
                 if alias.lower() in self._cache['by_name']:
-                    known = self._cache['by_name'][alias.lower()]
+                    cached = self._cache['by_name'][alias.lower()]
+                    known = cached['entity']
                     result.match_type = "exact"
                     result.matched_id = known.id
                     result.matched_name = known.name
@@ -434,21 +467,39 @@ class UtilityValidator(EntityValidator):
                     break
 
             if result.match_type == "none":
-                # Try fuzzy match
+                # Try fuzzy match against all known names (utilities + docket metadata)
                 match = self._fuzzy_match(name, self._cache['names'], threshold=80)
                 if match:
                     matched_name, score = match
                     result.match_type = "fuzzy"
                     result.matched_name = matched_name
                     result.match_score = score
-                    # Try to get ID if it's a Utility entity
+                    result.is_new = False
+
+                    # Try to get ID and type from utilities table
                     if matched_name.lower() in self._cache['by_name']:
-                        known = self._cache['by_name'][matched_name.lower()]
+                        cached = self._cache['by_name'][matched_name.lower()]
+                        known = cached['entity']
                         result.matched_id = known.id
                         result.utility_type = known.utility_type
-                    result.is_new = False
+                    # Otherwise try docket metadata
+                    elif matched_name in self._cache['docket_metadata']:
+                        meta = self._cache['docket_metadata'][matched_name]
+                        result.sector = meta.get('utility_type')
+                        result.from_docket_metadata = True
                 else:
                     result.is_new = True
+
+        # Enrich with docket metadata if we have a match
+        if result.matched_name and result.matched_name in self._cache['docket_metadata']:
+            meta = self._cache['docket_metadata'][result.matched_name]
+            if not result.sector:
+                result.sector = meta.get('utility_type')
+            result.from_docket_metadata = True
+
+            # Validate against state - boost confidence if utility operates in this state
+            if state_code and state_code in meta.get('states', set()):
+                result.match_score = min(1.0, result.match_score + 0.1)
 
         # Context scoring
         all_context = f"{context} {hearing_context.get('title', '')} {hearing_context.get('summary', '')}"
@@ -520,7 +571,7 @@ class DocketValidator(EntityValidator):
         self._known_dockets_cache: Dict[str, Dict] = {}
 
     def _load_known_dockets(self, state_code: str):
-        """Load known dockets for a state into cache."""
+        """Load known dockets for a state into cache with full metadata."""
         if state_code in self._known_dockets_cache:
             return
 
@@ -531,8 +582,32 @@ class DocketValidator(EntityValidator):
             KnownDocket.state_code == state_code
         ).all()
 
+        # Build lookup indexes
+        by_normalized = {}
+        by_title = {}  # For title-based fuzzy matching
+        by_utility = {}  # For utility-based lookup
+
+        for d in known:
+            norm_id = normalize_for_matching(d.normalized_id)
+            by_normalized[norm_id] = d
+
+            # Index by title words for fuzzy matching
+            if d.title:
+                title_key = d.title.lower()[:100]  # First 100 chars
+                by_title[title_key] = d
+
+            # Index by utility name
+            if d.utility_name:
+                util_key = d.utility_name.lower()
+                if util_key not in by_utility:
+                    by_utility[util_key] = []
+                by_utility[util_key].append(d)
+
         self._known_dockets_cache[state_code] = {
-            'by_normalized': {normalize_for_matching(d.normalized_id): d for d in known},
+            'by_normalized': by_normalized,
+            'by_title': by_title,
+            'by_utility': by_utility,
+            'titles': [d.title for d in known if d.title],  # For fuzzy matching
             'dockets': known,
         }
 
@@ -574,11 +649,18 @@ class DocketValidator(EntityValidator):
         self._load_known_dockets(state_code)
 
         # Match against known dockets
-        self._match_known_docket(result, state_code)
+        self._match_known_docket(result, state_code, hearing_context)
+
+        # Validate docket_type matches hearing context
+        all_context = f"{context} {hearing_context.get('title', '')} {hearing_context.get('summary', '')}".lower()
+        result.type_context_match = self._validate_docket_type_context(result, all_context)
 
         # Context scoring
-        all_context = f"{context} {hearing_context.get('title', '')} {hearing_context.get('summary', '')}"
         ctx_score, clues = self._calculate_context_score(all_context, REGULATORY_CONTEXT)
+
+        # Boost score if docket_type matches context
+        if result.type_context_match:
+            ctx_score = min(50, ctx_score + 15)
 
         # Calculate confidence
         result.confidence = self._calculate_confidence(result, ctx_score)
@@ -586,6 +668,31 @@ class DocketValidator(EntityValidator):
         result.review_reason = self._build_review_reason(result)
 
         return result
+
+    def _validate_docket_type_context(self, result: ValidatedDocket, context: str) -> bool:
+        """Check if docket_type matches the hearing context."""
+        if not result.known_docket_type:
+            return False
+
+        docket_type = result.known_docket_type.lower()
+
+        # Map docket types to context keywords
+        type_keywords = {
+            'rate case': ['rate case', 'rate increase', 'rate decrease', 'rate adjustment', 'general rate', 'base rate'],
+            'merger': ['merger', 'acquisition', 'combination', 'purchase'],
+            'certificate': ['certificate', 'authorization', 'franchise', 'cpcn'],
+            'complaint': ['complaint', 'dispute', 'violation'],
+            'rulemaking': ['rulemaking', 'rule', 'regulation', 'policy'],
+            'investigation': ['investigation', 'inquiry', 'audit', 'review'],
+            'application': ['application', 'petition', 'request', 'approval'],
+        }
+
+        for dt, keywords in type_keywords.items():
+            if dt in docket_type:
+                if any(kw in context for kw in keywords):
+                    return True
+
+        return False
 
     def _validate_format(self, docket_number: str, state_code: str) -> Tuple[bool, List[str]]:
         """Validate docket format against state-specific rules."""
@@ -600,8 +707,8 @@ class DocketValidator(EntityValidator):
 
         return len(issues) == 0, issues
 
-    def _match_known_docket(self, result: ValidatedDocket, state_code: str):
-        """Match against known dockets."""
+    def _match_known_docket(self, result: ValidatedDocket, state_code: str, hearing_context: Dict[str, Any]):
+        """Match against known dockets using ID, title, and utility."""
         from app.services.docket_parser import normalize_for_matching
 
         cache = self._known_dockets_cache.get(state_code, {})
@@ -613,19 +720,13 @@ class DocketValidator(EntityValidator):
 
         normalized = normalize_for_matching(result.normalized_name)
 
-        # Exact match
+        # Exact match by docket ID
         if normalized in by_normalized:
             known = by_normalized[normalized]
-            result.match_type = "exact"
-            result.matched_id = known.id
-            result.matched_name = known.docket_number
-            result.match_score = 1.0
-            result.known_title = known.title
-            result.known_utility = known.utility_name
-            result.is_new = False
+            self._enrich_from_known(result, known, "exact", 1.0)
             return
 
-        # Fuzzy match
+        # Fuzzy match by docket ID
         if FUZZY_AVAILABLE:
             matches = process.extractOne(
                 normalized,
@@ -637,16 +738,50 @@ class DocketValidator(EntityValidator):
             if matches:
                 matched_key, score, _ = matches
                 known = by_normalized[matched_key]
-                result.match_type = "fuzzy"
-                result.matched_id = known.id
-                result.matched_name = known.docket_number
-                result.match_score = score / 100.0
-                result.known_title = known.title
-                result.known_utility = known.utility_name
-                result.is_new = False
+                self._enrich_from_known(result, known, "fuzzy", score / 100.0)
                 return
 
+        # If no ID match, try title-based fuzzy matching (for malformed docket numbers)
+        titles = cache.get('titles', [])
+        if FUZZY_AVAILABLE and titles and result.context:
+            # Look for title matches in the hearing context
+            hearing_text = f"{hearing_context.get('title', '')} {hearing_context.get('summary', '')}"
+            title_match = process.extractOne(
+                hearing_text[:200],
+                titles,
+                scorer=fuzz.partial_ratio,
+                score_cutoff=60
+            )
+
+            if title_match:
+                matched_title, score, _ = title_match
+                by_title = cache.get('by_title', {})
+                for title_key, docket in by_title.items():
+                    if docket.title == matched_title:
+                        self._enrich_from_known(result, docket, "fuzzy", score / 100.0)
+                        result.review_reason = f"Matched by title similarity ({score}%)"
+                        return
+
         result.is_new = True
+
+    def _enrich_from_known(self, result: ValidatedDocket, known, match_type: str, score: float):
+        """Enrich result with all metadata from known docket."""
+        result.match_type = match_type
+        result.matched_id = known.id
+        result.matched_name = known.docket_number
+        result.match_score = score
+        result.is_new = False
+
+        # Core metadata
+        result.known_title = known.title
+        result.known_utility = known.utility_name
+
+        # Extended metadata from scraped docket data
+        result.known_utility_type = getattr(known, 'utility_type', None)
+        result.known_docket_type = getattr(known, 'docket_type', None)
+        result.known_status = getattr(known, 'status', None)
+        if hasattr(known, 'filing_date') and known.filing_date:
+            result.known_filing_date = str(known.filing_date)
 
     def _calculate_confidence(self, result: ValidatedDocket, ctx_score: int) -> int:
         """Calculate confidence score for docket."""
@@ -758,6 +893,9 @@ class EntityValidationPipeline:
             except Exception as e:
                 logger.warning(f"Failed to validate docket {docket_data}: {e}")
 
+        # Cross-entity validation: check utility-docket relationships
+        self._cross_validate_utilities_and_dockets(results)
+
         # Log summary
         logger.info(
             f"Validated entities: "
@@ -767,3 +905,78 @@ class EntityValidationPipeline:
         )
 
         return results
+
+    def _cross_validate_utilities_and_dockets(self, results: Dict[str, List]):
+        """
+        Cross-validate utilities against dockets.
+        If a docket's utility_name matches an extracted utility, boost confidence.
+        If there's a mismatch, flag for review.
+        """
+        utilities = results.get('utilities', [])
+        dockets = results.get('dockets', [])
+
+        if not utilities or not dockets:
+            return
+
+        # Build set of utility names (normalized) from extractions
+        utility_names = set()
+        utility_lookup = {}
+        for u in utilities:
+            if u.raw_name:
+                utility_names.add(u.raw_name.lower())
+                utility_lookup[u.raw_name.lower()] = u
+            if u.matched_name:
+                utility_names.add(u.matched_name.lower())
+                utility_lookup[u.matched_name.lower()] = u
+            for alias in u.aliases:
+                utility_names.add(alias.lower())
+                utility_lookup[alias.lower()] = u
+
+        # Check each docket
+        for docket in dockets:
+            if not docket.known_utility:
+                continue
+
+            docket_utility = docket.known_utility.lower()
+
+            # Check for exact match
+            if docket_utility in utility_names:
+                docket.utility_context_match = True
+                # Boost docket confidence
+                docket.confidence = min(100, docket.confidence + 10)
+
+                # Also boost the matching utility
+                if docket_utility in utility_lookup:
+                    utility = utility_lookup[docket_utility]
+                    utility.confidence = min(100, utility.confidence + 5)
+                    if not utility.review_reason:
+                        utility.review_reason = "Confirmed by docket reference"
+
+                logger.debug(f"Cross-validation: docket {docket.docket_number} utility '{docket.known_utility}' matches extraction")
+
+            elif FUZZY_AVAILABLE:
+                # Try fuzzy match
+                from rapidfuzz import fuzz, process
+                match = process.extractOne(
+                    docket_utility,
+                    list(utility_names),
+                    scorer=fuzz.ratio,
+                    score_cutoff=80
+                )
+
+                if match:
+                    matched_name, score, _ = match
+                    docket.utility_context_match = True
+                    docket.confidence = min(100, docket.confidence + 5)
+
+                    if matched_name in utility_lookup:
+                        utility = utility_lookup[matched_name]
+                        utility.confidence = min(100, utility.confidence + 3)
+
+                    logger.debug(f"Cross-validation: fuzzy match {docket.known_utility} ~ {matched_name} ({score}%)")
+                else:
+                    # Utility mismatch - flag for review
+                    if docket.review_reason:
+                        docket.review_reason += f"; Utility mismatch: docket has '{docket.known_utility}'"
+                    else:
+                        docket.review_reason = f"Utility mismatch: docket has '{docket.known_utility}'"

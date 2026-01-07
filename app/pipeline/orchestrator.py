@@ -52,7 +52,9 @@ class PipelineStatus(str, Enum):
 
 
 # Hearing status progression through the pipeline
-# Flow: discovered -> downloaded -> transcribed -> analyzed -> extracted -> complete
+# Flow: discovered -> downloaded -> transcribed -> analyzed -> smart_extracted -> extracted -> complete
+# Note: Analyze extracts topics/utilities via LLM, SmartExtract finds dockets via regex+fuzzy matching
+#       All entities go to Review for human verification.
 HEARING_STATUSES = {
     "discovered": {"next": "downloading", "stage": "download"},
     "downloading": {"next": "downloaded", "stage": "download", "in_progress": True},
@@ -60,23 +62,31 @@ HEARING_STATUSES = {
     "transcribing": {"next": "transcribed", "stage": "transcribe", "in_progress": True},
     "transcribed": {"next": "analyzing", "stage": "analyze"},
     "analyzing": {"next": "analyzed", "stage": "analyze", "in_progress": True},
-    "analyzed": {"next": "extracting", "stage": "extract"},
+    "analyzed": {"next": "smart_extracting", "stage": "smart_extract"},
+    "smart_extracting": {"next": "smart_extracted", "stage": "smart_extract", "in_progress": True},
+    "smart_extracted": {"next": "extracting", "stage": "extract"},
     "extracting": {"next": "extracted", "stage": "extract", "in_progress": True},
     "extracted": {"next": "complete", "stage": None},
     "complete": {"next": None, "stage": None, "terminal": True},
     "error": {"next": None, "stage": None, "retryable": True},
     "failed": {"next": None, "stage": None, "terminal": True},
     "skipped": {"next": None, "stage": None, "terminal": True},
+    # Legacy statuses (for backward compatibility with existing data)
+    "linking": {"next": "analyzed", "stage": None, "legacy": True},
+    "linked": {"next": "smart_extracting", "stage": "smart_extract"},  # Treat as analyzed
+    "matching": {"next": "analyzed", "stage": None, "legacy": True},
+    "matched": {"next": "smart_extracting", "stage": "smart_extract"},  # Treat as analyzed
 }
 
 # Statuses that can be picked up for processing (non-in-progress, non-terminal)
-PROCESSABLE_STATUSES = ["discovered", "downloaded", "transcribed", "analyzed", "extracted", "error"]
+PROCESSABLE_STATUSES = ["discovered", "downloaded", "transcribed", "analyzed", "smart_extracted", "linked", "matched", "extracted", "error"]
 
 # Map from stage name to (in_progress_status, complete_status)
 STAGE_TO_STATUS = {
     "download": ("downloading", "downloaded"),
     "transcribe": ("transcribing", "transcribed"),
     "analyze": ("analyzing", "analyzed"),
+    "smart_extract": ("smart_extracting", "smart_extracted"),
     "extract": ("extracting", "extracted"),
 }
 
@@ -104,6 +114,7 @@ class OrchestratorConfig:
     states: Optional[List[str]] = None  # State codes to process
     only_stage: Optional[str] = None  # download, transcribe, analyze, extract
     max_hearings: Optional[int] = None  # Max hearings per run
+    hearing_ids: Optional[List[int]] = None  # Specific hearing IDs to process
 
     @classmethod
     def from_env(cls):
@@ -149,13 +160,15 @@ class PipelineOrchestrator:
             from app.pipeline.stages.download import DownloadStage
             from app.pipeline.stages.transcribe import TranscribeStage
             from app.pipeline.stages.analyze import AnalyzeStage
+            from app.pipeline.stages.smart_extract import SmartExtractStage
             from app.pipeline.stages.extract import ExtractStage
 
             self._stages = {
                 "download": DownloadStage(),
                 "transcribe": TranscribeStage(),
-                "analyze": AnalyzeStage(),
-                "extract": ExtractStage(),
+                "analyze": AnalyzeStage(),  # LLM analysis + topics/utilities extraction
+                "smart_extract": SmartExtractStage(),  # Regex docket extraction
+                "extract": ExtractStage(),  # Embeddings for search
             }
         return self._stages
 
@@ -296,6 +309,12 @@ class PipelineOrchestrator:
         db = self._get_db()
 
         try:
+            # Check if already running - prevent concurrent runs
+            state = self._get_state(db)
+            if state.status == PipelineStatus.RUNNING.value:
+                logger.warning("Pipeline is already running, aborting new run request")
+                return {"hearings_processed": 0, "total_cost": 0, "aborted": True}
+
             # Update state to running
             self._update_state(
                 db,
@@ -311,7 +330,7 @@ class PipelineOrchestrator:
                 }
             )
 
-            logger.info(f"Pipeline started (states={self.config.states}, only_stage={self.config.only_stage})")
+            logger.info(f"Pipeline started (states={self.config.states}, only_stage={self.config.only_stage}, max_hearings={self.config.max_hearings}, hearing_ids={self.config.hearing_ids})")
 
             while not self._stop_requested.is_set():
                 # Check limits
@@ -331,7 +350,8 @@ class PipelineOrchestrator:
                 if hearing:
                     if dry_run:
                         logger.info(f"[DRY RUN] Would process: {hearing.id} - {hearing.title[:50]}... (status={hearing.status})")
-                        # Mark as processed to avoid infinite loop in dry run
+                        # Track as attempted to avoid infinite loop in dry run
+                        self._hearings_attempted.add(hearing.id)
                         continue
                     else:
                         self._process_hearing(hearing, db)
@@ -383,13 +403,18 @@ class PipelineOrchestrator:
                 "download": ["discovered"],
                 "transcribe": ["downloaded"],
                 "analyze": ["transcribed"],
-                "extract": ["analyzed"],
+                "smart_extract": ["analyzed", "linked", "matched"],  # Legacy statuses for backward compat
+                "extract": ["smart_extracted"],
             }
             statuses = stage_input_statuses.get(self.config.only_stage, PROCESSABLE_STATUSES)
         else:
             statuses = PROCESSABLE_STATUSES
 
         query = db.query(Hearing).filter(Hearing.status.in_(statuses))
+
+        # Filter by specific hearing IDs if provided (highest priority filter)
+        if self.config.hearing_ids:
+            query = query.filter(Hearing.id.in_(self.config.hearing_ids))
 
         # Exclude hearings already attempted in this run (to avoid re-trying failed ones in same run)
         if self._hearings_attempted:
@@ -579,7 +604,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Exit after processing available work")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
     parser.add_argument("--states", help="Comma-separated state codes (e.g., FL,GA,TX)")
-    parser.add_argument("--only", choices=["download", "transcribe", "analyze", "extract"],
+    parser.add_argument("--only", choices=["download", "transcribe", "analyze", "smart_extract", "extract"],
                        help="Only run specific stage")
     parser.add_argument("--max-cost", type=float, help="Max cost for this run")
     parser.add_argument("--max-hearings", type=int, help="Max hearings to process")

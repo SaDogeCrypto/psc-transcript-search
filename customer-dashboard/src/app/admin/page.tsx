@@ -220,17 +220,32 @@ export default function AdminDashboardPage() {
         />
       </div>
 
-      {/* Hearings by Status */}
+      {/* Hearings by Status - ordered by pipeline progression */}
       {Object.keys(stats.hearings_by_status).length > 0 && (
         <div className="card" style={{ marginTop: '1rem' }}>
           <h3 style={{ marginBottom: '1rem', color: 'var(--gray-700)' }}>Hearings by Status</h3>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))', gap: '1rem' }}>
-            {Object.entries(stats.hearings_by_status).map(([status, count]) => (
-              <div key={status} style={{ textAlign: 'center', padding: '1rem', background: 'var(--gray-50)', borderRadius: 'var(--radius)' }}>
-                <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--gray-800)' }}>{count}</div>
-                <div style={{ fontSize: '0.8rem', color: 'var(--gray-500)', textTransform: 'capitalize' }}>{status}</div>
-              </div>
-            ))}
+            {(() => {
+              const pipelineOrder = [
+                'discovered', 'downloading', 'downloaded',
+                'transcribing', 'transcribed',
+                'analyzing', 'analyzed',
+                'extracting', 'extracted',
+                'complete', 'error', 'failed', 'skipped'
+              ];
+              return Object.entries(stats.hearings_by_status)
+                .sort(([a], [b]) => {
+                  const aIdx = pipelineOrder.indexOf(a);
+                  const bIdx = pipelineOrder.indexOf(b);
+                  return (aIdx === -1 ? 999 : aIdx) - (bIdx === -1 ? 999 : bIdx);
+                })
+                .map(([status, count]) => (
+                  <div key={status} style={{ textAlign: 'center', padding: '1rem', background: 'var(--gray-50)', borderRadius: 'var(--radius)' }}>
+                    <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--gray-800)' }}>{count}</div>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--gray-500)', textTransform: 'capitalize' }}>{status}</div>
+                  </div>
+                ));
+            })()}
           </div>
         </div>
       )}

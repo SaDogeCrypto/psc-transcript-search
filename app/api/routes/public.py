@@ -19,7 +19,9 @@ from app.models.schemas import (
     DocketListItem, DocketDetail, DocketHearingItem, DocketSearchResponse,
     WatchlistDocket, WatchlistAddRequest, WatchlistResponse, LatestMention,
     ActivityItem, ActivityFeedResponse, DocketMention,
-    TimelineItem, DocketWithTimeline
+    TimelineItem, DocketWithTimeline,
+    TrendingDocket, UtilitySuggestion, SuggestionsResponse,
+    FollowUtilityRequest, FollowUtilityResponse
 )
 
 router = APIRouter(prefix="/api", tags=["public"])
@@ -210,15 +212,15 @@ def get_hearing(hearing_id: int, db: Session = Depends(get_db)):
         # Analysis fields
         summary=analysis.summary if analysis else None,
         one_sentence_summary=analysis.one_sentence_summary if analysis else None,
-        participants=analysis.participants if analysis else None,
-        issues=analysis.issues if analysis else None,
-        commitments=analysis.commitments if analysis else None,
-        commissioner_concerns=analysis.commissioner_concerns if analysis else None,
+        participants=analysis.participants_json if analysis else None,
+        issues=analysis.issues_json if analysis else None,
+        commitments=analysis.commitments_json if analysis else None,
+        commissioner_concerns=analysis.commissioner_concerns_json if analysis else None,
         commissioner_mood=analysis.commissioner_mood if analysis else None,
         likely_outcome=analysis.likely_outcome if analysis else None,
         outcome_confidence=float(analysis.outcome_confidence) if analysis and analysis.outcome_confidence else None,
-        risk_factors=analysis.risk_factors if analysis else None,
-        quotes=analysis.quotes if analysis else None,
+        risk_factors=analysis.risk_factors_json if analysis else None,
+        quotes=analysis.quotes_json if analysis else None,
         segment_count=segment_count,
         word_count=word_count
     )
@@ -868,6 +870,156 @@ def remove_from_watchlist(
         raise HTTPException(status_code=404, detail="Docket not in watchlist")
 
     return {"message": "Removed from watchlist", "docket_id": docket_id}
+
+
+@router.post("/watchlist/follow-utility", response_model=FollowUtilityResponse)
+def follow_utility(
+    request: FollowUtilityRequest,
+    user_id: int = Query(1, description="User ID (demo mode uses 1)"),
+    db: Session = Depends(get_db)
+):
+    """Add all active dockets for a utility to user's watchlist."""
+    # Get all active dockets for this utility
+    dockets = db.query(Docket).filter(
+        Docket.company == request.utility_name,
+        Docket.status.in_(["open", "pending_decision"])
+    ).all()
+
+    if not dockets:
+        raise HTTPException(status_code=404, detail="No active dockets found for this utility")
+
+    # Get existing watched docket IDs
+    existing = db.query(UserWatchlist.docket_id).filter(
+        UserWatchlist.user_id == user_id
+    ).all()
+    existing_ids = {e.docket_id for e in existing}
+
+    # Add new dockets to watchlist
+    added_ids = []
+    for docket in dockets:
+        if docket.id not in existing_ids:
+            watchlist_item = UserWatchlist(
+                user_id=user_id,
+                docket_id=docket.id,
+                notify_on_mention=True
+            )
+            db.add(watchlist_item)
+            added_ids.append(docket.normalized_id)
+
+    db.commit()
+
+    return FollowUtilityResponse(
+        added_count=len(added_ids),
+        docket_ids=added_ids
+    )
+
+
+# ============================================================================
+# SUGGESTIONS / QUICK ADD
+# ============================================================================
+
+@router.get("/suggestions", response_model=SuggestionsResponse)
+def get_suggestions(
+    user_id: int = Query(1, description="User ID (demo mode uses 1)"),
+    db: Session = Depends(get_db)
+):
+    """Get suggested dockets and utilities for quick add tiles."""
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+    thirty_days_ago = now - timedelta(days=30)
+
+    # Get user's current watchlist docket IDs
+    watched = db.query(UserWatchlist.docket_id).filter(
+        UserWatchlist.user_id == user_id
+    ).all()
+    watched_ids = {w.docket_id for w in watched}
+
+    # Query trending dockets (most mentions in last 30 days)
+    # Join with hearings to count recent mentions
+    trending_query = db.query(
+        Docket.id,
+        Docket.normalized_id,
+        Docket.company,
+        State.code.label("state_code"),
+        func.count(HearingDocket.hearing_id).label("mention_count")
+    ).join(
+        State, Docket.state_id == State.id
+    ).join(
+        HearingDocket, HearingDocket.docket_id == Docket.id
+    ).join(
+        Hearing, HearingDocket.hearing_id == Hearing.id
+    ).filter(
+        Hearing.hearing_date >= thirty_days_ago,
+        Docket.id.notin_(watched_ids) if watched_ids else True
+    ).group_by(
+        Docket.id, Docket.normalized_id, Docket.company, State.code
+    ).order_by(
+        desc("mention_count")
+    ).limit(8).all()
+
+    trending = [
+        TrendingDocket(
+            id=t.id,
+            docket_id=t.normalized_id,
+            utility_name=t.company,
+            mention_count=t.mention_count,
+            state=t.state_code,
+            already_watching=t.id in watched_ids
+        )
+        for t in trending_query
+    ]
+
+    # Query major utilities with most active dockets
+    # Get utilities grouped by company name with their docket counts
+    utilities_query = db.query(
+        Docket.company,
+        func.count(Docket.id).label("active_docket_count")
+    ).join(
+        State, Docket.state_id == State.id
+    ).filter(
+        Docket.company.isnot(None),
+        Docket.status.in_(["open", "pending_decision"])
+    ).group_by(
+        Docket.company
+    ).order_by(
+        desc("active_docket_count")
+    ).limit(8).all()
+
+    # Check which utilities user is already fully following
+    utilities = []
+    for u in utilities_query:
+        if u.company:
+            # Get states for this utility
+            utility_states = db.query(func.distinct(State.code)).join(
+                Docket, Docket.state_id == State.id
+            ).filter(
+                Docket.company == u.company,
+                Docket.status.in_(["open", "pending_decision"])
+            ).all()
+            states_list = [s[0] for s in utility_states]
+
+            # Get count of this utility's dockets user is watching
+            utility_watched_count = db.query(func.count(UserWatchlist.docket_id)).join(
+                Docket, UserWatchlist.docket_id == Docket.id
+            ).filter(
+                UserWatchlist.user_id == user_id,
+                Docket.company == u.company
+            ).scalar() or 0
+
+            already_following = utility_watched_count >= u.active_docket_count
+
+            utilities.append(UtilitySuggestion(
+                utility_name=u.company,
+                states=states_list,
+                active_docket_count=u.active_docket_count,
+                already_following=already_following
+            ))
+
+    return SuggestionsResponse(
+        trending=trending,
+        utilities=utilities
+    )
 
 
 # ============================================================================

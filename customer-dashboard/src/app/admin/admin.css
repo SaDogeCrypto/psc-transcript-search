@@ -3,9 +3,31 @@
 :root {
   --primary: #2563eb;
   --primary-dark: #1d4ed8;
+  --primary-50: #eff6ff;
+  --primary-100: #dbeafe;
+  --primary-200: #bfdbfe;
+  --primary-400: #60a5fa;
+  --primary-600: #2563eb;
+  --primary-700: #1d4ed8;
   --success: #16a34a;
+  --success-bg: #f0fdf4;
+  --success-50: #f0fdf4;
+  --success-100: #dcfce7;
+  --success-200: #bbf7d0;
+  --success-600: #16a34a;
+  --success-700: #15803d;
   --warning: #ca8a04;
+  --warning-50: #fefce8;
+  --warning-100: #fef9c3;
+  --warning-200: #fef08a;
+  --warning-600: #ca8a04;
+  --warning-700: #a16207;
   --danger: #dc2626;
+  --danger-50: #fef2f2;
+  --danger-100: #fee2e2;
+  --danger-200: #fecaca;
+  --danger-600: #dc2626;
+  --danger-700: #b91c1c;
   --gray-50: #f9fafb;
   --gray-100: #f3f4f6;
   --gray-200: #e5e7eb;
@@ -225,6 +247,8 @@ tbody tr:hover {
 .btn-danger:hover { background: #fee2e2; }
 .btn-success { background: white; color: var(--success); border-color: #86efac; }
 .btn-success:hover { background: #d1fae5; }
+.btn-warning { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+.btn-warning:hover { background: #fde68a; }
 
 /* Loading Spinner */
 .loading {
@@ -245,6 +269,25 @@ tbody tr:hover {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes progress-indeterminate {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(150%); }
+  100% { transform: translateX(400%); }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+.animate-pulse {
+  animation: shimmer 2s infinite linear;
 }
 
 /* Grid Layouts */

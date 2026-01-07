@@ -2,6 +2,7 @@
 Transcribe Stage - Transcribes audio using Whisper.
 
 Supports:
+- Groq Whisper API (if GROQ_API_KEY is set) - FASTEST
 - Azure OpenAI Whisper API (if AZURE_OPENAI_ENDPOINT is set)
 - OpenAI Whisper API (if OPENAI_API_KEY is set)
 - Local whisper model (if USE_OPENAI_WHISPER=false)
@@ -10,6 +11,8 @@ Saves transcript to database and creates segments.
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # Load .env before reading environment variables
 import json
 import logging
 import tempfile
@@ -23,6 +26,9 @@ from sqlalchemy.orm import Session
 from app.pipeline.stages.base import BaseStage, StageResult
 from app.models.database import Hearing, Transcript, Segment, PipelineJob
 
+# Import transcript cleaner for post-processing
+from scripts.psc_transcript_cleaner import clean_transcript_text
+
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -30,9 +36,13 @@ AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "data/audio"))
 USE_OPENAI_WHISPER = os.getenv("USE_OPENAI_WHISPER", "true").lower() == "true"
 LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "medium")  # Local model
 
-# Azure Whisper has 25MB limit - use 24MB to be safe
+# Groq has 25MB limit - use 24MB to be safe
 MAX_FILE_SIZE_BYTES = 24 * 1024 * 1024  # 24MB
 CHUNK_DURATION_SECONDS = 600  # 10 minutes per chunk
+
+# Groq configuration (preferred - fastest)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 
 # Azure OpenAI configuration
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -44,7 +54,8 @@ AZURE_WHISPER_DEPLOYMENT = os.getenv("AZURE_WHISPER_DEPLOYMENT", "whisper")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
 
 # Whisper API pricing (as of 2024)
-WHISPER_COST_PER_MINUTE = 0.006  # $0.006 per minute
+WHISPER_COST_PER_MINUTE = 0.006  # $0.006 per minute (OpenAI/Azure)
+GROQ_WHISPER_COST_PER_MINUTE = 0.04 / 60  # $0.04/hour = $0.000667/minute
 
 
 class TranscribeStage(BaseStage):
@@ -57,13 +68,25 @@ class TranscribeStage(BaseStage):
     def __init__(self, audio_dir: Optional[Path] = None):
         self.audio_dir = audio_dir or AUDIO_DIR
         self._openai_client = None
+        self._groq_client = None
         self._local_model = None
-        self._use_azure = bool(AZURE_OPENAI_ENDPOINT)
+        # Priority: Groq > Azure > OpenAI
+        self._use_groq = bool(GROQ_API_KEY)
+        self._use_azure = bool(AZURE_OPENAI_ENDPOINT) and not self._use_groq
+
+    @property
+    def groq_client(self):
+        """Lazy load Groq client."""
+        if self._groq_client is None and self._use_groq:
+            from groq import Groq
+            self._groq_client = Groq(api_key=GROQ_API_KEY)
+            logger.info("Using Groq Whisper API (fastest)")
+        return self._groq_client
 
     @property
     def openai_client(self):
         """Lazy load OpenAI client (Azure or standard)."""
-        if self._openai_client is None and USE_OPENAI_WHISPER:
+        if self._openai_client is None and USE_OPENAI_WHISPER and not self._use_groq:
             if self._use_azure:
                 from openai import AzureOpenAI
                 self._openai_client = AzureOpenAI(
@@ -86,6 +109,71 @@ class TranscribeStage(BaseStage):
             logger.info(f"Loading local Whisper model: {LOCAL_WHISPER_MODEL}")
             self._local_model = whisper.load_model(LOCAL_WHISPER_MODEL)
         return self._local_model
+
+    def _build_initial_prompt(self, hearing: Hearing, db: Session) -> str:
+        """Build Whisper initial_prompt with domain context to improve accuracy.
+
+        The prompt helps Whisper recognize:
+        - State-specific PSC terminology
+        - Utility company names
+        - Commissioner names
+        - Docket number formats
+        """
+        state_code = hearing.state.code if hearing.state else ""
+        state_name = hearing.state.name if hearing.state else ""
+
+        # Base regulatory terminology
+        prompt_parts = [
+            f"This is a {state_name} Public Service Commission hearing transcript.",
+            "Technical terms: kilowatt, megawatt, kVA, OCGA, docket, tariff, rate case, certificate of convenience and necessity, CCNN, intervenor, stipulation, evidentiary hearing, pre-filed testimony, rebuttal testimony.",
+        ]
+
+        # State-specific terms and commissioners
+        state_context = {
+            "GA": {
+                "terms": "Georgia Power, Southern Company, Walton EMC, Jackson EMC, Carroll EMC, Douglas County EMC, Central Georgia EMC, Oglethorpe Power",
+                "commissioners": "Commissioner Echols, Commissioner Shaw, Commissioner Johnson, Commissioner McDonald, Commissioner Pridemore",
+                "docket_format": "Docket numbers like 44280, 55973",
+            },
+            "TX": {
+                "terms": "ERCOT, PUCT, Oncor, CenterPoint, AEP Texas, Texas-New Mexico Power, Entergy Texas",
+                "commissioners": "Chairman Lake, Commissioner Cobos, Commissioner Glotfelty, Commissioner McAdams",
+                "docket_format": "Project numbers like 55999, 58777",
+            },
+            "CA": {
+                "terms": "CPUC, PG&E, Pacific Gas and Electric, Southern California Edison, SCE, San Diego Gas & Electric, SDG&E, Cal Water",
+                "commissioners": "Commissioner Reynolds, Commissioner Houck, Commissioner Shiroma",
+                "docket_format": "Application numbers like A.25-07-003, R.22-08-001",
+            },
+            "FL": {
+                "terms": "Florida PSC, FPSC, Florida Power & Light, FPL, Duke Energy Florida, Tampa Electric, TECO, NextEra",
+                "commissioners": "Chairman Fay, Commissioner Clark, Commissioner La Rosa, Commissioner Passidomo",
+                "docket_format": "Docket numbers like 20250035-GU",
+            },
+            "OH": {
+                "terms": "PUCO, Ohio Power Siting Board, AEP Ohio, Duke Energy Ohio, FirstEnergy, Ohio Edison, Toledo Edison",
+                "commissioners": "Chairman Randazzo, Commissioner Conway, Commissioner Friedeman",
+                "docket_format": "Case numbers like 25-0594-EL-AIR",
+            },
+            "AZ": {
+                "terms": "Arizona Corporation Commission, ACC, Arizona Public Service, APS, Tucson Electric Power, TEP, Salt River Project, SRP",
+                "commissioners": "Commissioner O'Connor, Commissioner Tovar, Commissioner Márquez Peterson",
+                "docket_format": "Docket numbers like T-21349A-25-0016, W-02703A-25-0189",
+            },
+        }
+
+        if state_code in state_context:
+            ctx = state_context[state_code]
+            prompt_parts.append(f"Utilities: {ctx['terms']}")
+            prompt_parts.append(f"Speakers may include: {ctx['commissioners']}")
+            prompt_parts.append(f"{ctx['docket_format']}")
+
+        # Add hearing title for context
+        if hearing.title:
+            # Extract potential utility/company names from title
+            prompt_parts.append(f"Hearing: {hearing.title[:200]}")
+
+        return " ".join(prompt_parts)
 
     def validate(self, hearing: Hearing, db: Session) -> bool:
         """Check if audio file exists."""
@@ -118,11 +206,15 @@ class TranscribeStage(BaseStage):
             )
 
         try:
+            # Build initial prompt for better accuracy
+            initial_prompt = self._build_initial_prompt(hearing, db)
+            logger.debug(f"Using initial_prompt: {initial_prompt[:100]}...")
+
             # Transcribe using appropriate method
             if USE_OPENAI_WHISPER:
-                result = self._transcribe_openai(audio_path, hearing)
+                result = self._transcribe_openai(audio_path, hearing, initial_prompt)
             else:
-                result = self._transcribe_local(audio_path, hearing)
+                result = self._transcribe_local(audio_path, hearing, initial_prompt)
 
             if not result["success"]:
                 return StageResult(
@@ -234,15 +326,74 @@ class TranscribeStage(BaseStage):
         except Exception:
             pass
 
-    def _transcribe_openai(self, audio_path: Path, hearing: Hearing) -> dict:
-        """Transcribe using OpenAI/Azure Whisper API."""
+    def _transcribe_openai(self, audio_path: Path, hearing: Hearing, initial_prompt: str = "") -> dict:
+        """Transcribe using Groq/OpenAI/Azure Whisper API."""
         # Check if file needs chunking
         if self._needs_chunking(audio_path):
-            return self._transcribe_chunked(audio_path, hearing)
+            return self._transcribe_chunked(audio_path, hearing, initial_prompt)
 
-        return self._transcribe_single_file(audio_path, hearing)
+        # Use Groq if available (fastest)
+        if self._use_groq:
+            return self._transcribe_groq(audio_path, hearing, initial_prompt)
 
-    def _transcribe_single_file(self, audio_path: Path, hearing: Hearing) -> dict:
+        return self._transcribe_single_file(audio_path, hearing, initial_prompt)
+
+    def _transcribe_groq(self, audio_path: Path, hearing: Hearing, initial_prompt: str = "") -> dict:
+        """Transcribe using Groq Whisper API (fastest option)."""
+        logger.info(f"Transcribing with Groq Whisper ({GROQ_WHISPER_MODEL}): {audio_path}")
+
+        # Get audio duration for logging
+        duration_seconds = hearing.duration_seconds or self._get_audio_duration(audio_path)
+        duration_minutes = (duration_seconds or 0) / 60
+
+        try:
+            with open(audio_path, "rb") as audio_file:
+                response = self.groq_client.audio.transcriptions.create(
+                    model=GROQ_WHISPER_MODEL,
+                    file=audio_file,
+                    response_format="verbose_json",
+                    prompt=initial_prompt if initial_prompt else None,
+                )
+
+            # Parse response
+            full_text = response.text
+            segments = []
+
+            # Groq returns segments in the response
+            if hasattr(response, 'segments') and response.segments:
+                for i, seg in enumerate(response.segments):
+                    if isinstance(seg, dict):
+                        segments.append({
+                            "index": i,
+                            "start": seg.get("start", 0),
+                            "end": seg.get("end", 0),
+                            "text": seg.get("text", "").strip(),
+                        })
+                    else:
+                        segments.append({
+                            "index": i,
+                            "start": getattr(seg, "start", 0),
+                            "end": getattr(seg, "end", 0),
+                            "text": getattr(seg, "text", "").strip(),
+                        })
+
+            cost_usd = duration_minutes * GROQ_WHISPER_COST_PER_MINUTE  # Currently free
+
+            logger.info(f"Groq transcription complete: {len(segments)} segments, {duration_minutes:.1f} min (free)")
+
+            return {
+                "success": True,
+                "text": full_text,
+                "segments": segments,
+                "model": GROQ_WHISPER_MODEL,
+                "cost_usd": cost_usd,
+            }
+
+        except Exception as e:
+            logger.error(f"Groq transcription error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _transcribe_single_file(self, audio_path: Path, hearing: Hearing, initial_prompt: str = "") -> dict:
         """Transcribe a single audio file (under size limit)."""
         # Use Azure deployment name or OpenAI model name
         model_name = AZURE_WHISPER_DEPLOYMENT if self._use_azure else WHISPER_MODEL
@@ -260,7 +411,8 @@ class TranscribeStage(BaseStage):
                     model=model_name,
                     file=audio_file,
                     response_format="verbose_json",
-                    timestamp_granularities=["segment"]
+                    timestamp_granularities=["segment"],
+                    prompt=initial_prompt if initial_prompt else None,
                 )
 
             # Parse response
@@ -301,13 +453,26 @@ class TranscribeStage(BaseStage):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def _transcribe_chunked(self, audio_path: Path, hearing: Hearing) -> dict:
+    def _transcribe_chunked(self, audio_path: Path, hearing: Hearing, initial_prompt: str = "") -> dict:
         """Transcribe large audio file by splitting into chunks."""
-        model_name = AZURE_WHISPER_DEPLOYMENT if self._use_azure else WHISPER_MODEL
-        provider = "Azure OpenAI" if self._use_azure else "OpenAI"
+        # Determine provider
+        logger.info(f"Chunked transcription - _use_groq={self._use_groq}, GROQ_API_KEY set={bool(GROQ_API_KEY)}")
+        if self._use_groq:
+            model_name = GROQ_WHISPER_MODEL
+            provider = "Groq"
+            cost_per_minute = GROQ_WHISPER_COST_PER_MINUTE
+            logger.info(f"Using Groq for chunked transcription, model={model_name}")
+        elif self._use_azure:
+            model_name = AZURE_WHISPER_DEPLOYMENT
+            provider = "Azure OpenAI"
+            cost_per_minute = WHISPER_COST_PER_MINUTE
+        else:
+            model_name = WHISPER_MODEL
+            provider = "OpenAI"
+            cost_per_minute = WHISPER_COST_PER_MINUTE
 
         file_size_mb = audio_path.stat().st_size / (1024 * 1024)
-        logger.info(f"File {audio_path.name} is {file_size_mb:.1f}MB - splitting into chunks")
+        logger.info(f"File {audio_path.name} is {file_size_mb:.1f}MB - splitting into chunks (using {provider})")
 
         # Get total duration for cost calculation
         duration_seconds = hearing.duration_seconds or self._get_audio_duration(audio_path)
@@ -329,12 +494,22 @@ class TranscribeStage(BaseStage):
 
                 try:
                     with open(chunk_path, "rb") as audio_file:
-                        response = self.openai_client.audio.transcriptions.create(
-                            model=model_name,
-                            file=audio_file,
-                            response_format="verbose_json",
-                            timestamp_granularities=["segment"]
-                        )
+                        # Use Groq or OpenAI client
+                        if self._use_groq:
+                            response = self.groq_client.audio.transcriptions.create(
+                                model=model_name,
+                                file=audio_file,
+                                response_format="verbose_json",
+                                prompt=initial_prompt if initial_prompt else None,
+                            )
+                        else:
+                            response = self.openai_client.audio.transcriptions.create(
+                                model=model_name,
+                                file=audio_file,
+                                response_format="verbose_json",
+                                timestamp_granularities=["segment"],
+                                prompt=initial_prompt if initial_prompt else None,
+                            )
 
                     # Add text
                     if response.text:
@@ -364,7 +539,9 @@ class TranscribeStage(BaseStage):
                     logger.debug(f"Chunk {chunk_path.name}: {len(response.segments) if hasattr(response, 'segments') else 0} segments")
 
                 except Exception as e:
+                    import traceback
                     logger.error(f"Error transcribing chunk {chunk_path.name}: {e}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                     # Continue with other chunks rather than failing entirely
                     continue
 
@@ -373,7 +550,7 @@ class TranscribeStage(BaseStage):
 
             # Merge all text
             full_text = " ".join(all_text_parts)
-            cost_usd = duration_minutes * WHISPER_COST_PER_MINUTE
+            cost_usd = duration_minutes * cost_per_minute
 
             logger.info(f"{provider} chunked transcription complete: {len(all_segments)} segments, ${cost_usd:.4f}")
 
@@ -392,7 +569,7 @@ class TranscribeStage(BaseStage):
             # Clean up chunk files
             self._cleanup_chunks(chunks)
 
-    def _transcribe_local(self, audio_path: Path, hearing: Hearing) -> dict:
+    def _transcribe_local(self, audio_path: Path, hearing: Hearing, initial_prompt: str = "") -> dict:
         """Transcribe using local Whisper model."""
         logger.info(f"Transcribing with local Whisper ({LOCAL_WHISPER_MODEL}): {audio_path}")
 
@@ -401,7 +578,8 @@ class TranscribeStage(BaseStage):
                 str(audio_path),
                 language="en",
                 verbose=False,
-                word_timestamps=False
+                word_timestamps=False,
+                initial_prompt=initial_prompt if initial_prompt else None,
             )
 
             segments = []
@@ -430,6 +608,21 @@ class TranscribeStage(BaseStage):
         """Save transcript and segments to database."""
         full_text = result.get("text", "")
         segments_data = result.get("segments", [])
+
+        # Apply transcript cleaning (fix common Whisper errors)
+        try:
+            original_text = full_text
+            full_text = clean_transcript_text(full_text)
+
+            # Also clean each segment
+            for seg in segments_data:
+                if seg.get("text"):
+                    seg["text"] = clean_transcript_text(seg["text"])
+
+            if full_text != original_text:
+                logger.info(f"Transcript cleaned for hearing {hearing.id}")
+        except Exception as e:
+            logger.warning(f"Transcript cleaning failed (using original): {e}")
 
         # Create transcript record
         transcript = Transcript(

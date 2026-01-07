@@ -27,7 +27,6 @@ export function Tabs({ active }: { active: string }) {
     { id: 'overview', label: 'Overview', href: '/admin' },
     { id: 'sources', label: 'Sources', href: '/admin/sources' },
     { id: 'hearings', label: 'Hearings', href: '/admin/hearings' },
-    { id: 'runs', label: 'Scraper Runs', href: '/admin/runs' },
     { id: 'pipeline', label: 'Pipeline', href: '/admin/pipeline' },
     { id: 'schedules', label: 'Schedules', href: '/admin/schedules' },
   ];
@@ -52,15 +51,28 @@ export function Tabs({ active }: { active: string }) {
 export function PageLayout({
   children,
   activeTab,
+  title,
+  subtitle,
 }: {
   children: React.ReactNode;
-  activeTab: string;
+  activeTab?: string;
+  title?: string;
+  subtitle?: string;
 }) {
+  // Determine active tab from title if not provided
+  const active = activeTab || (title ? title.toLowerCase() : 'overview');
+
   return (
     <>
       <Header />
       <main className="main-content">
-        <Tabs active={activeTab} />
+        <Tabs active={active} />
+        {(title || subtitle) && (
+          <div style={{ marginBottom: '1.5rem' }}>
+            {title && <h2 style={{ fontSize: '1.5rem', fontWeight: 600, marginBottom: '0.25rem' }}>{title}</h2>}
+            {subtitle && <p style={{ color: 'var(--gray-500)' }}>{subtitle}</p>}
+          </div>
+        )}
         {children}
       </main>
     </>

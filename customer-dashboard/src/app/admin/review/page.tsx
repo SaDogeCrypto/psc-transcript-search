@@ -3,8 +3,7 @@
 import { useEffect, useState } from 'react';
 import {
   CheckCircle, XCircle, Link2, SkipForward,
-  Search, RefreshCw, AlertCircle, Filter, Sparkles,
-  ExternalLink, Globe, Loader2
+  Search, RefreshCw, AlertCircle, Filter
 } from 'lucide-react';
 import { PageLayout } from '../components/Layout';
 
@@ -41,6 +40,41 @@ interface ReviewStats {
   dockets: number;
   topics: number;
   utilities: number;
+  hearings: number;
+}
+
+// Hearing-grouped review types
+interface EntityReviewItem {
+  id: number;
+  entity_type: string;
+  entity_id: number;
+  name: string;
+  role?: string;
+  category?: string;
+  context?: string;
+  confidence: string;
+  confidence_score?: number;
+  match_type?: string;
+  review_reason?: string;
+  known_docket_id?: number;
+  known_utility?: string;
+  known_title?: string;
+  utility_match?: boolean;
+  suggestions: ReviewSuggestion[];
+}
+
+interface HearingReviewItem {
+  hearing_id: number;
+  hearing_title: string;
+  hearing_date?: string;
+  state_code?: string;
+  topics: EntityReviewItem[];
+  utilities: EntityReviewItem[];
+  dockets: EntityReviewItem[];
+  total_entities: number;
+  needs_review_count: number;
+  lowest_confidence?: number;
+  utility_docket_matches: number;
 }
 
 // Extraction review types
@@ -99,14 +133,12 @@ export default function ReviewQueuePage() {
   const [error, setError] = useState<string | null>(null);
   const [processing, setProcessing] = useState<number | null>(null);
 
-  // Extraction review state
-  const [extractionItems, setExtractionItems] = useState<ExtractionReviewItem[]>([]);
-  const [extractionStats, setExtractionStats] = useState<ExtractionStats | null>(null);
-  const [activeTab, setActiveTab] = useState<'extraction' | 'legacy'>('extraction');
-  const [verifications, setVerifications] = useState<Record<number, VerificationResult>>({});
-  const [verifying, setVerifying] = useState<number | null>(null);
-  const [matching, setMatching] = useState<number | null>(null);
-  const [matchResults, setMatchResults] = useState<Record<number, { success: boolean; message: string }>>({});
+  // View mode (hearings is default, legacy for old data)
+  const [activeTab, setActiveTab] = useState<'hearings' | 'legacy'>('hearings');
+
+  // Hearing-grouped review state
+  const [hearingItems, setHearingItems] = useState<HearingReviewItem[]>([]);
+  const [bulkProcessing, setBulkProcessing] = useState<number | null>(null);
 
   // Filters
   const [entityFilter, setEntityFilter] = useState<string>('');
@@ -120,17 +152,6 @@ export default function ReviewQueuePage() {
       }
     } catch (err) {
       console.error('Failed to load stats:', err);
-    }
-  }
-
-  async function loadExtractionStats() {
-    try {
-      const res = await fetch(`${API_URL}/admin/review/extraction/stats`);
-      if (res.ok) {
-        setExtractionStats(await res.json());
-      }
-    } catch (err) {
-      console.error('Failed to load extraction stats:', err);
     }
   }
 
@@ -153,31 +174,51 @@ export default function ReviewQueuePage() {
     }
   }
 
-  async function loadExtractionQueue() {
+  async function loadHearingQueue() {
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams();
       if (stateFilter) params.set('state', stateFilter);
-      params.set('status', 'needs_review');
-      params.set('limit', '50');
+      params.set('limit', '20');
 
-      const res = await fetch(`${API_URL}/admin/review/extraction/queue?${params}`);
-      if (!res.ok) throw new Error('Failed to fetch extraction queue');
-      setExtractionItems(await res.json());
+      const res = await fetch(`${API_URL}/admin/review/hearings?${params}`);
+      if (!res.ok) throw new Error('Failed to fetch hearing queue');
+      setHearingItems(await res.json());
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load extraction queue');
+      setError(err instanceof Error ? err.message : 'Failed to load hearing queue');
     } finally {
       setLoading(false);
     }
   }
 
+  async function handleBulkApprove(hearingId: number, action: string, threshold?: number) {
+    setBulkProcessing(hearingId);
+    try {
+      const res = await fetch(`${API_URL}/admin/review/hearings/${hearingId}/bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          confidence_threshold: threshold || 80,
+        }),
+      });
+      if (!res.ok) throw new Error('Bulk action failed');
+      // Reload the queue
+      loadHearingQueue();
+      loadStats();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Bulk action failed');
+    } finally {
+      setBulkProcessing(null);
+    }
+  }
+
   useEffect(() => {
     loadStats();
-    loadExtractionStats();
-    if (activeTab === 'extraction') {
-      loadExtractionQueue();
-    } else {
+    if (activeTab === 'hearings') {
+      loadHearingQueue();
+    } else if (activeTab === 'legacy') {
       loadQueue();
     }
   }, [entityFilter, stateFilter, activeTab]);
@@ -215,97 +256,6 @@ export default function ReviewQueuePage() {
     }
   }
 
-  async function handleExtractionAction(
-    item: ExtractionReviewItem,
-    action: 'accept' | 'accept_suggestion' | 'correct' | 'reject',
-    correctedDocketId?: number
-  ) {
-    setProcessing(item.id);
-    try {
-      const res = await fetch(`${API_URL}/admin/review/extraction/${item.id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action,
-          corrected_docket_id: correctedDocketId,
-        }),
-      });
-
-      if (!res.ok) {
-        const error = await res.json();
-        throw new Error(error.detail || 'Action failed');
-      }
-
-      // Remove from list
-      setExtractionItems(extractionItems.filter(i => i.id !== item.id));
-      loadExtractionStats();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Action failed');
-    } finally {
-      setProcessing(null);
-    }
-  }
-
-  async function verifyExtraction(item: ExtractionReviewItem) {
-    setVerifying(item.id);
-    try {
-      const res = await fetch(`${API_URL}/admin/review/extraction/${item.id}/verify`);
-      if (!res.ok) {
-        throw new Error('Verification failed');
-      }
-      const result: VerificationResult = await res.json();
-      setVerifications(prev => ({ ...prev, [item.id]: result }));
-    } catch (err) {
-      setVerifications(prev => ({
-        ...prev,
-        [item.id]: {
-          found: false,
-          docket_number: item.raw_text,
-          state_code: item.state_code || '',
-          title: null,
-          company: null,
-          filing_date: null,
-          status: null,
-          utility_type: null,
-          url: null,
-          error: err instanceof Error ? err.message : 'Verification failed'
-        }
-      }));
-    } finally {
-      setVerifying(null);
-    }
-  }
-
-  async function matchFromSource(item: ExtractionReviewItem) {
-    setMatching(item.id);
-    try {
-      const res = await fetch(`${API_URL}/admin/review/extraction/${item.id}/match-from-source`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-      });
-      if (!res.ok) {
-        throw new Error('Match failed');
-      }
-      const result = await res.json();
-      setMatchResults(prev => ({ ...prev, [item.id]: { success: result.success, message: result.message } }));
-
-      if (result.success) {
-        // Remove from list after successful match
-        setExtractionItems(prev => prev.filter(i => i.id !== item.id));
-        // Refresh stats
-        loadExtractionStats();
-      }
-    } catch (err) {
-      setMatchResults(prev => ({
-        ...prev,
-        [item.id]: { success: false, message: err instanceof Error ? err.message : 'Match failed' }
-      }));
-    } finally {
-      setMatching(null);
-    }
-  }
-
   const entityTypeLabel: Record<string, string> = {
     docket: 'Dockets',
     topic: 'Topics',
@@ -330,53 +280,57 @@ export default function ReviewQueuePage() {
 
   return (
     <PageLayout activeTab="review" title="Review Queue" subtitle="Manual verification of entity matches">
-      {/* Tab Switcher */}
-      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem' }}>
-        <button
-          className={`btn ${activeTab === 'extraction' ? 'btn-primary' : 'btn-secondary'}`}
-          onClick={() => setActiveTab('extraction')}
-        >
-          <Sparkles size={16} />
-          Smart Extraction
-          {extractionStats && extractionStats.needs_review > 0 && (
-            <span className="badge badge-warning" style={{ marginLeft: '0.5rem' }}>
-              {extractionStats.needs_review}
-            </span>
-          )}
-        </button>
-        <button
-          className={`btn ${activeTab === 'legacy' ? 'btn-primary' : 'btn-secondary'}`}
-          onClick={() => setActiveTab('legacy')}
-        >
-          Legacy Review
-          {stats && stats.total > 0 && (
-            <span className="badge badge-gray" style={{ marginLeft: '0.5rem' }}>
-              {stats.total}
-            </span>
-          )}
-        </button>
+      {/* View Mode */}
+      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem', alignItems: 'center' }}>
+        <span style={{ fontWeight: 600, color: 'var(--gray-600)' }}>Review entities grouped by hearing</span>
+        <div style={{ flex: 1 }} />
+        {/* Legacy toggle for old data */}
+        {stats && stats.total > 0 && activeTab !== 'legacy' && (
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => setActiveTab('legacy')}
+            style={{ fontSize: '0.75rem' }}
+          >
+            View Legacy ({stats.total})
+          </button>
+        )}
+        {activeTab === 'legacy' && (
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={() => setActiveTab('hearings')}
+            style={{ fontSize: '0.75rem' }}
+          >
+            ← Back to Hearings
+          </button>
+        )}
       </div>
 
-      {/* Extraction Stats */}
-      {activeTab === 'extraction' && extractionStats && (
+      {/* Hearings Stats */}
+      {activeTab === 'hearings' && stats && (
         <div className="stats-grid" style={{ marginBottom: '1.5rem' }}>
           <div className="stat-card">
-            <div className="stat-value">{extractionStats.needs_review}</div>
-            <div className="stat-label">Needs Review</div>
+            <div className="stat-value">{stats.hearings}</div>
+            <div className="stat-label">Hearings</div>
           </div>
-          {Object.entries(extractionStats.by_state).map(([state, count]) => (
-            <div
-              key={state}
-              className="stat-card"
-              onClick={() => setStateFilter(state)}
-              style={{ cursor: 'pointer' }}
-            >
-              <div className="stat-value">{count}</div>
-              <div className="stat-label">{state}</div>
-            </div>
-          ))}
+          <div className="stat-card">
+            <div className="stat-value">{stats.total}</div>
+            <div className="stat-label">Total Entities</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{stats.dockets}</div>
+            <div className="stat-label">Dockets</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{stats.utilities}</div>
+            <div className="stat-label">Utilities</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{stats.topics}</div>
+            <div className="stat-label">Topics</div>
+          </div>
         </div>
       )}
+
 
       {/* Legacy Stats */}
       {activeTab === 'legacy' && stats && (
@@ -435,7 +389,10 @@ export default function ReviewQueuePage() {
 
           <button
             className="btn btn-secondary"
-            onClick={() => activeTab === 'extraction' ? loadExtractionQueue() : loadQueue()}
+            onClick={() => {
+              if (activeTab === 'hearings') loadHearingQueue();
+              else loadQueue();
+            }}
           >
             <RefreshCw size={16} /> Refresh
           </button>
@@ -466,26 +423,27 @@ export default function ReviewQueuePage() {
         </div>
       )}
 
-      {/* Extraction Queue Items */}
-      {activeTab === 'extraction' && !loading && extractionItems.length === 0 && (
+      {/* Hearing-Grouped Queue */}
+      {activeTab === 'hearings' && !loading && hearingItems.length === 0 && (
         <div className="card" style={{ textAlign: 'center', padding: '3rem' }}>
           <CheckCircle size={48} style={{ color: 'var(--success)', marginBottom: '1rem' }} />
           <h3 style={{ marginBottom: '0.5rem' }}>All Caught Up!</h3>
-          <p style={{ color: 'var(--gray-500)' }}>No extraction candidates need review right now.</p>
+          <p style={{ color: 'var(--gray-500)' }}>No hearings need entity review right now.</p>
         </div>
       )}
 
-      {activeTab === 'extraction' && !loading && extractionItems.map((item) => (
+      {activeTab === 'hearings' && !loading && hearingItems.map((hearing) => (
         <div
-          key={`extraction-${item.id}`}
+          key={`hearing-${hearing.hearing_id}`}
           className="card"
           style={{
-            marginBottom: '1rem',
-            opacity: processing === item.id ? 0.5 : 1,
-            position: 'relative'
+            marginBottom: '1.5rem',
+            opacity: bulkProcessing === hearing.hearing_id ? 0.5 : 1,
+            position: 'relative',
+            border: hearing.lowest_confidence && hearing.lowest_confidence < 70 ? '2px solid var(--warning)' : undefined,
           }}
         >
-          {processing === item.id && (
+          {bulkProcessing === hearing.hearing_id && (
             <div style={{
               position: 'absolute',
               inset: 0,
@@ -499,254 +457,169 @@ export default function ReviewQueuePage() {
             </div>
           )}
 
-          {/* Header */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem' }}>
+          {/* Hearing Header */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1rem', borderBottom: '1px solid var(--gray-200)', paddingBottom: '1rem' }}>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
-                <span style={{ fontSize: '1.25rem', fontWeight: 600, fontFamily: 'monospace' }}>
-                  {item.raw_text}
-                </span>
-                <span className="badge badge-info">{item.state_code}</span>
-                <span className={`badge ${item.format_valid ? 'badge-success' : 'badge-warning'}`}>
-                  {item.format_valid ? 'Valid Format' : 'Invalid Format'}
-                </span>
-                <span className="badge badge-gray">
-                  Score: {item.confidence_score}
+                <span className="badge badge-primary">{hearing.state_code}</span>
+                <span style={{ fontSize: '1.1rem', fontWeight: 600 }}>
+                  {hearing.hearing_title || 'Untitled Hearing'}
                 </span>
               </div>
               <div style={{ fontSize: '0.875rem', color: 'var(--gray-500)' }}>
-                {item.hearing_title} &bull; {item.hearing_date || 'No date'}
+                {hearing.hearing_date || 'No date'} &bull; {hearing.total_entities} entities to review
+                {hearing.lowest_confidence !== undefined && (
+                  <span style={{ marginLeft: '0.5rem' }}>
+                    &bull; Lowest confidence: <strong style={{ color: hearing.lowest_confidence < 70 ? 'var(--warning)' : 'inherit' }}>{hearing.lowest_confidence}%</strong>
+                  </span>
+                )}
               </div>
-              {item.review_reason && (
-                <div style={{ fontSize: '0.875rem', color: 'var(--warning)', marginTop: '0.25rem' }}>
-                  {item.review_reason}
-                </div>
-              )}
             </div>
-
             <div style={{ display: 'flex', gap: '0.5rem' }}>
-              {/* Verify button for new docket candidates */}
-              {item.match_type === 'none' && !verifications[item.id] && (
-                <button
-                  className="btn btn-secondary"
-                  style={{ padding: '0.375rem 0.75rem' }}
-                  onClick={() => verifyExtraction(item)}
-                  disabled={verifying === item.id}
-                >
-                  {verifying === item.id ? (
-                    <><Loader2 size={16} className="spin" /> Verifying...</>
-                  ) : (
-                    <><Globe size={16} /> Verify on Source</>
-                  )}
-                </button>
-              )}
-              {!item.suggested_correction && item.match_type === 'none' && (
-                <button
-                  className="btn btn-primary"
-                  style={{ padding: '0.375rem 0.75rem' }}
-                  onClick={() => handleExtractionAction(item, 'accept')}
-                >
-                  <CheckCircle size={16} /> Accept as New
-                </button>
-              )}
               <button
-                className="btn btn-danger"
-                style={{ padding: '0.375rem 0.75rem' }}
-                onClick={() => handleExtractionAction(item, 'reject')}
+                className="btn btn-success btn-sm"
+                onClick={() => handleBulkApprove(hearing.hearing_id, 'approve_all')}
+                title="Approve all entities"
               >
-                <XCircle size={16} /> Reject
+                <CheckCircle size={14} /> Approve All
+              </button>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => handleBulkApprove(hearing.hearing_id, 'approve_high_confidence', 80)}
+                title="Approve entities with confidence >= 80%"
+              >
+                Approve High Conf
+              </button>
+              <button
+                className="btn btn-danger btn-sm"
+                onClick={() => handleBulkApprove(hearing.hearing_id, 'reject_all')}
+                title="Reject all entities"
+              >
+                <XCircle size={14} /> Reject All
               </button>
             </div>
           </div>
 
-          {/* Context */}
-          {(item.context_before || item.context_after) && (
-            <div style={{
-              background: 'var(--gray-100)',
-              padding: '0.75rem',
-              borderRadius: 'var(--radius)',
-              marginBottom: '1rem',
-              fontFamily: 'monospace',
-              fontSize: '0.875rem',
-              color: 'var(--gray-600)'
-            }}>
-              {item.context_before && <span>...{item.context_before}</span>}
-              <span style={{ fontWeight: 700, color: 'var(--primary)' }}> [{item.raw_text}] </span>
-              {item.context_after && <span>{item.context_after}...</span>}
-            </div>
-          )}
-
-          {/* Verification Result */}
-          {verifications[item.id] && (
-            <div style={{
-              background: verifications[item.id].found ? 'var(--success-bg)' : 'var(--danger-bg)',
-              border: `1px solid ${verifications[item.id].found ? 'var(--success)' : 'var(--danger)'}`,
-              padding: '0.75rem',
-              borderRadius: 'var(--radius)',
-              marginBottom: '1rem',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                    {verifications[item.id].found ? (
-                      <CheckCircle size={18} style={{ color: 'var(--success)' }} />
-                    ) : (
-                      <XCircle size={18} style={{ color: 'var(--danger)' }} />
-                    )}
-                    <span style={{ fontWeight: 600 }}>
-                      {verifications[item.id].found ? 'Verified on Source' : 'Not Found on Source'}
-                    </span>
-                  </div>
-                  {verifications[item.id].found && (
-                    <div style={{ fontSize: '0.875rem', color: 'var(--gray-600)' }}>
-                      {verifications[item.id].title && (
-                        <div><strong>Title:</strong> {verifications[item.id].title}</div>
-                      )}
-                      {verifications[item.id].company && (
-                        <div><strong>Company:</strong> {verifications[item.id].company}</div>
-                      )}
-                      {verifications[item.id].utility_type && (
-                        <div><strong>Utility Type:</strong> {verifications[item.id].utility_type}</div>
-                      )}
-                      {verifications[item.id].filing_date && (
-                        <div><strong>Filed:</strong> {verifications[item.id].filing_date}</div>
-                      )}
-                      {verifications[item.id].status && (
-                        <div><strong>Status:</strong> {verifications[item.id].status}</div>
-                      )}
-                    </div>
-                  )}
-                  {verifications[item.id].error && (
-                    <div style={{ fontSize: '0.875rem', color: 'var(--danger)' }}>
-                      Error: {verifications[item.id].error}
-                    </div>
-                  )}
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'flex-end' }}>
-                  {verifications[item.id].url && (
-                    <a
-                      href={verifications[item.id].url!}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="btn btn-secondary"
-                      style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
-                    >
-                      <ExternalLink size={14} /> View on PSC
-                    </a>
-                  )}
-                  {verifications[item.id].found && !matchResults[item.id]?.success && (
-                    <button
-                      onClick={() => matchFromSource(item)}
-                      disabled={matching === item.id}
-                      className="btn btn-primary"
-                      style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem' }}
-                    >
-                      {matching === item.id ? (
-                        <><Loader2 size={14} className="spin" /> Matching...</>
-                      ) : (
-                        <><CheckCircle size={14} /> Match &amp; Create Docket</>
-                      )}
-                    </button>
-                  )}
-                  {matchResults[item.id] && (
-                    <span style={{
-                      fontSize: '0.75rem',
-                      color: matchResults[item.id].success ? 'var(--success)' : 'var(--danger)'
-                    }}>
-                      {matchResults[item.id].message}
-                    </span>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Format Issues */}
-          {item.format_issues && item.format_issues.length > 0 && (
+          {/* Utilities Section */}
+          {hearing.utilities.length > 0 && (
             <div style={{ marginBottom: '1rem' }}>
-              <div style={{ fontSize: '0.875rem', fontWeight: 500, marginBottom: '0.5rem', color: 'var(--gray-600)' }}>
-                Format issues:
-              </div>
-              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                {item.format_issues.map((issue, idx) => (
-                  <span key={idx} className="badge badge-warning">{issue}</span>
+              <h4 style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--gray-600)', marginBottom: '0.5rem' }}>
+                Utilities ({hearing.utilities.length})
+              </h4>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                {hearing.utilities.map((u) => (
+                  <div
+                    key={`util-${u.id}`}
+                    style={{
+                      padding: '0.5rem 0.75rem',
+                      background: 'var(--gray-100)',
+                      borderRadius: '4px',
+                      fontSize: '0.875rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                    }}
+                  >
+                    <span style={{ fontWeight: 500 }}>{u.name}</span>
+                    {u.role && <span className="badge badge-gray">{u.role}</span>}
+                    {confidenceBadge(u.confidence)}
+                    {u.confidence_score !== null && u.confidence_score !== undefined && (
+                      <span style={{ color: 'var(--gray-500)', fontSize: '0.75rem' }}>{u.confidence_score}%</span>
+                    )}
+                  </div>
                 ))}
               </div>
             </div>
           )}
 
-          {/* Suggested Correction */}
-          {item.suggested_correction && (
-            <div style={{
-              background: 'var(--success-bg)',
-              border: '1px solid var(--success)',
-              padding: '0.75rem',
-              borderRadius: 'var(--radius)',
-              marginBottom: '1rem',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div>
-                  <div style={{ fontSize: '0.875rem', color: 'var(--gray-600)', marginBottom: '0.25rem' }}>
-                    Suggested correction:
-                  </div>
-                  <div style={{ fontFamily: 'monospace', fontWeight: 600 }}>
-                    {item.raw_text} → <span style={{ color: 'var(--success)' }}>{item.suggested_correction}</span>
-                  </div>
-                  {item.matched_docket_title && (
-                    <div style={{ fontSize: '0.875rem', color: 'var(--gray-500)', marginTop: '0.25rem' }}>
-                      {item.matched_docket_title}
+          {/* Dockets Section */}
+          {hearing.dockets.length > 0 && (
+            <div style={{ marginBottom: '1rem' }}>
+              <h4 style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--gray-600)', marginBottom: '0.5rem' }}>
+                Dockets ({hearing.dockets.length})
+                {hearing.utility_docket_matches > 0 && (
+                  <span style={{ fontWeight: 400, color: 'var(--success)', marginLeft: '0.5rem' }}>
+                    {hearing.utility_docket_matches} utility match{hearing.utility_docket_matches !== 1 ? 'es' : ''}
+                  </span>
+                )}
+              </h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                {hearing.dockets.map((d) => (
+                  <div
+                    key={`docket-${d.id}`}
+                    style={{
+                      padding: '0.75rem',
+                      background: d.utility_match ? 'rgba(0, 184, 148, 0.1)' : 'var(--gray-100)',
+                      borderRadius: '4px',
+                      border: d.utility_match ? '1px solid var(--success)' : '1px solid var(--gray-200)',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
+                      <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{d.name}</span>
+                      {confidenceBadge(d.confidence)}
+                      {d.confidence_score !== null && d.confidence_score !== undefined && (
+                        <span style={{ color: 'var(--gray-500)', fontSize: '0.75rem' }}>{d.confidence_score}%</span>
+                      )}
+                      {d.utility_match && (
+                        <span className="badge badge-success">Utility Match</span>
+                      )}
                     </div>
-                  )}
-                  {item.correction_evidence && item.correction_evidence.length > 0 && (
-                    <div style={{ fontSize: '0.75rem', color: 'var(--gray-500)', marginTop: '0.25rem' }}>
-                      Evidence: {item.correction_evidence.join(', ')}
-                    </div>
-                  )}
-                </div>
-                <button
-                  className="btn btn-success"
-                  onClick={() => handleExtractionAction(item, 'accept_suggestion')}
-                >
-                  <CheckCircle size={16} /> Accept Correction
-                </button>
+                    {d.known_title && (
+                      <div style={{ fontSize: '0.875rem', color: 'var(--gray-600)' }}>
+                        {d.known_title}
+                      </div>
+                    )}
+                    {d.known_utility && (
+                      <div style={{ fontSize: '0.875rem', color: 'var(--gray-500)' }}>
+                        Utility: {d.known_utility}
+                      </div>
+                    )}
+                    {d.review_reason && (
+                      <div style={{ fontSize: '0.75rem', color: 'var(--warning)', marginTop: '0.25rem' }}>
+                        {d.review_reason}
+                      </div>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
           )}
 
-          {/* Matched Known Docket */}
-          {item.match_type === 'exact' && item.matched_docket_number && (
-            <div style={{
-              background: 'var(--info-bg)',
-              border: '1px solid var(--info)',
-              padding: '0.75rem',
-              borderRadius: 'var(--radius)',
-              marginBottom: '1rem',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div>
-                  <div style={{ fontSize: '0.875rem', color: 'var(--gray-600)', marginBottom: '0.25rem' }}>
-                    Exact match found:
+          {/* Topics Section */}
+          {hearing.topics.length > 0 && (
+            <div>
+              <h4 style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--gray-600)', marginBottom: '0.5rem' }}>
+                Topics ({hearing.topics.length})
+              </h4>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                {hearing.topics.map((t) => (
+                  <div
+                    key={`topic-${t.id}`}
+                    style={{
+                      padding: '0.25rem 0.5rem',
+                      background: 'var(--gray-100)',
+                      borderRadius: '4px',
+                      fontSize: '0.875rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                    }}
+                  >
+                    <span>{t.name}</span>
+                    {t.category && t.category !== 'uncategorized' && (
+                      <span className="badge badge-gray">{t.category}</span>
+                    )}
+                    {t.confidence_score !== null && t.confidence_score !== undefined && (
+                      <span style={{ color: 'var(--gray-500)', fontSize: '0.75rem' }}>{t.confidence_score}%</span>
+                    )}
                   </div>
-                  <div style={{ fontFamily: 'monospace', fontWeight: 600 }}>
-                    {item.matched_docket_number}
-                  </div>
-                  {item.matched_docket_title && (
-                    <div style={{ fontSize: '0.875rem', color: 'var(--gray-500)', marginTop: '0.25rem' }}>
-                      {item.matched_docket_title}
-                    </div>
-                  )}
-                </div>
-                <button
-                  className="btn btn-primary"
-                  onClick={() => handleExtractionAction(item, 'accept')}
-                >
-                  <Link2 size={16} /> Link & Accept
-                </button>
+                ))}
               </div>
             </div>
           )}
         </div>
       ))}
+
 
       {/* Legacy Queue Items */}
       {activeTab === 'legacy' && !loading && items.length === 0 && (

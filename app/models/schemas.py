@@ -33,8 +33,8 @@ class SourceResponse(BaseModel):
     source_type: str
     url: str
     enabled: bool
-    check_frequency_hours: int
-    created_at: datetime
+    check_frequency_hours: Optional[int] = 24
+    created_at: Optional[datetime] = None
 
 
 class SourceWithStatus(SourceResponse):
@@ -412,6 +412,22 @@ class PipelineStartRequest(BaseModel):
     max_hearings: Optional[int] = None  # Max hearings to process
 
 
+class RunStageRequest(BaseModel):
+    """Request to run a specific stage on specific hearings."""
+    stage: str  # 'download', 'transcribe', 'analyze', 'extract'
+    hearing_ids: List[int]  # List of hearing IDs to process
+
+
+class RunStageResponse(BaseModel):
+    """Response from running a stage on hearings."""
+    message: str
+    stage: str
+    queued_count: int
+    skipped_count: int
+    queued_ids: List[int]
+    skipped_ids: List[int]
+
+
 class PipelineActivityItem(BaseModel):
     """A single pipeline activity entry."""
     id: int
@@ -492,3 +508,121 @@ class ScheduleUpdateRequest(BaseModel):
     target: Optional[str] = None
     enabled: Optional[bool] = None
     config: Optional[dict] = None
+
+
+# ============================================================================
+# SUGGESTIONS / QUICK ADD SCHEMAS
+# ============================================================================
+
+class TrendingDocket(BaseModel):
+    """A trending docket suggestion for quick add."""
+    id: int
+    docket_id: str  # normalized_id like "FL-20250035"
+    utility_name: Optional[str] = None
+    mention_count: int
+    state: str
+    already_watching: bool = False
+
+
+class UtilitySuggestion(BaseModel):
+    """A utility suggestion for following all its dockets."""
+    utility_name: str
+    states: List[str]
+    active_docket_count: int
+    already_following: bool = False
+
+
+class SuggestionsResponse(BaseModel):
+    """Response containing suggested dockets and utilities."""
+    trending: List[TrendingDocket]
+    utilities: List[UtilitySuggestion]
+
+
+class FollowUtilityRequest(BaseModel):
+    """Request to follow all dockets for a utility."""
+    utility_name: str
+
+
+class FollowUtilityResponse(BaseModel):
+    """Response after following a utility."""
+    added_count: int
+    docket_ids: List[str]
+
+
+# ============================================================================
+# DOCKET SOURCE / KNOWN DOCKET SCHEMAS
+# ============================================================================
+
+class DocketSourceResponse(BaseModel):
+    """Docket source (PSC website) status."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    state_code: str
+    state_name: str
+    commission_name: Optional[str] = None
+    search_url: Optional[str] = None
+    scraper_type: Optional[str] = None
+    enabled: bool
+    last_scraped_at: Optional[datetime] = None
+    last_scrape_count: Optional[int] = None
+    last_error: Optional[str] = None
+
+
+class KnownDocketResponse(BaseModel):
+    """Known authoritative docket from PSC."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    state_code: str
+    docket_number: str
+    normalized_id: str
+    year: Optional[int] = None
+    sector: Optional[str] = None
+    title: Optional[str] = None
+    utility_name: Optional[str] = None
+    status: Optional[str] = None
+    case_type: Optional[str] = None
+    source_url: Optional[str] = None
+
+
+class DocketDiscoveryRequest(BaseModel):
+    """Request to start docket discovery."""
+    states: Optional[List[str]] = None
+    year: Optional[int] = None
+    limit_per_state: int = 1000
+
+
+class DocketDiscoveryResponse(BaseModel):
+    """Response from docket discovery."""
+    total_scraped: int
+    total_new: int
+    total_updated: int
+    by_state: dict
+    errors: List[dict]
+
+
+class MatchDocketsRequest(BaseModel):
+    """Request to run docket matching."""
+    states: Optional[List[str]] = None
+    max_hearings: Optional[int] = None
+
+
+class DataQualityStats(BaseModel):
+    """Docket data quality statistics."""
+    verified: int = 0
+    likely: int = 0
+    possible: int = 0
+    unverified: int = 0
+
+
+class ExtendedPipelineStatus(BaseModel):
+    """Extended pipeline status including docket discovery."""
+    pipeline_status: str
+
+    discovery: dict  # docket_sources, docket_sources_pending, hearing_sources, known_dockets
+    processing: dict  # download_pending, transcribe_pending, analyze_pending, match_pending, complete
+
+    data_quality: DataQualityStats
+
+    today: dict  # processed, cost, errors
