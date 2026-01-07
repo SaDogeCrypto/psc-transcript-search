@@ -188,6 +188,86 @@ class DocketScraper:
             logger.error(f"Capsolver error: {e}")
             return None
 
+    async def _solve_recaptcha_v2_capsolver(self, website_url: str, sitekey: str) -> Optional[str]:
+        """
+        Solve Google reCAPTCHA v2 using Capsolver API.
+
+        Args:
+            website_url: The URL of the page with the reCAPTCHA
+            sitekey: The reCAPTCHA sitekey (data-sitekey attribute)
+
+        Returns:
+            The solved token (g-recaptcha-response), or None if solving failed
+        """
+        settings = get_settings()
+        if not settings.capsolver.enabled or not settings.capsolver.api_key:
+            logger.warning("Capsolver not configured")
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                # Create task for reCAPTCHA v2
+                create_payload = {
+                    "clientKey": settings.capsolver.api_key,
+                    "task": {
+                        "type": "ReCaptchaV2TaskProxyLess",
+                        "websiteKey": sitekey,
+                        "websiteURL": website_url
+                    }
+                }
+
+                logger.info(f"Capsolver: Creating reCAPTCHA v2 task for {website_url}")
+                create_resp = await client.post(
+                    f"{settings.capsolver.api_url}/createTask",
+                    json=create_payload
+                )
+                create_data = create_resp.json()
+
+                if create_data.get("errorId", 0) != 0:
+                    logger.error(f"Capsolver createTask error: {create_data.get('errorDescription')}")
+                    return None
+
+                task_id = create_data.get("taskId")
+                if not task_id:
+                    logger.error("Capsolver: No taskId in response")
+                    return None
+
+                logger.info(f"Capsolver: Task created, ID={task_id}")
+
+                # Poll for result (max 120 seconds)
+                max_polls = 40  # 40 * 3s = 120s
+                for i in range(max_polls):
+                    await asyncio.sleep(3)
+
+                    result_payload = {
+                        "clientKey": settings.capsolver.api_key,
+                        "taskId": task_id
+                    }
+                    result_resp = await client.post(
+                        f"{settings.capsolver.api_url}/getTaskResult",
+                        json=result_payload
+                    )
+                    result_data = result_resp.json()
+
+                    status = result_data.get("status")
+                    if status == "ready":
+                        token = result_data.get("solution", {}).get("gRecaptchaResponse")
+                        logger.info(f"Capsolver: reCAPTCHA v2 solved after {(i+1)*3}s")
+                        return token
+                    elif status == "failed":
+                        logger.error(f"Capsolver: Task failed: {result_data.get('errorDescription')}")
+                        return None
+
+                    if i % 5 == 0:
+                        logger.info(f"Capsolver: Still processing... ({(i+1)*3}s)")
+
+                logger.error("Capsolver: Timeout waiting for reCAPTCHA solution")
+                return None
+
+        except Exception as e:
+            logger.error(f"Capsolver reCAPTCHA error: {e}")
+            return None
+
     async def scrape_docket(self, state_code: str, docket_number: str) -> ScrapedDocket:
         """
         Scrape docket metadata from a state PSC website.
@@ -200,6 +280,30 @@ class DocketScraper:
             ScrapedDocket with all available metadata
         """
         result = ScrapedDocket(state_code=state_code, docket_number=docket_number)
+
+        # Minnesota uses Cloudflare Turnstile - needs Playwright + Capsolver
+        # Handle before config check since MN constructs its own URL
+        if state_code == 'MN':
+            settings = get_settings()
+            if not settings.capsolver.enabled:
+                result.error = "MN requires Capsolver for Turnstile - set CAPSOLVER_API_KEY and USE_CAPSOLVER=true"
+                return result
+            if not PLAYWRIGHT_AVAILABLE:
+                result.error = "MN requires Playwright for Turnstile bypass"
+                return result
+            return await self._scrape_minnesota_with_capsolver(docket_number, result, None)
+
+        # Wisconsin uses Google reCAPTCHA v2 - needs Playwright + Capsolver
+        # Handle before config check since WI constructs its own URL
+        if state_code == 'WI':
+            settings = get_settings()
+            if not settings.capsolver.enabled:
+                result.error = "WI requires Capsolver for reCAPTCHA - set CAPSOLVER_API_KEY and USE_CAPSOLVER=true"
+                return result
+            if not PLAYWRIGHT_AVAILABLE:
+                result.error = "Playwright not installed - required for WI scraping"
+                return result
+            return await self._scrape_wisconsin_with_capsolver(docket_number, result, None)
 
         # Get config (may not be in cache if not enabled)
         config = self._configs.get(state_code)
@@ -219,17 +323,6 @@ class DocketScraper:
         if not url_template:
             result.error = f"No detail URL template for {state_code}"
             return result
-
-        # Minnesota uses Cloudflare Turnstile - needs Playwright + Capsolver
-        if state_code == 'MN':
-            settings = get_settings()
-            if not settings.capsolver.enabled:
-                result.error = "MN requires Capsolver for Turnstile - set CAPSOLVER_API_KEY and USE_CAPSOLVER=true"
-                return result
-            if not PLAYWRIGHT_AVAILABLE:
-                result.error = "Playwright not installed - required for MN scraping"
-                return result
-            return await self._scrape_minnesota_with_capsolver(docket_number, result, config)
 
         # States that require Playwright for JavaScript rendering / bot protection
         playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI', 'KS')
@@ -1912,6 +2005,172 @@ class DocketScraper:
 
         except Exception as e:
             result.error = f"MN scrape error: {str(e)}"
+            return result
+
+    async def _scrape_wisconsin_with_capsolver(
+        self, docket_number: str, result: ScrapedDocket, config: Optional[Dict] = None
+    ) -> ScrapedDocket:
+        """
+        Scrape Wisconsin PSC docket using Playwright + Capsolver for reCAPTCHA.
+
+        WI docket format: UTIL_ID-CASE_TYPE-SEQ_NUM (e.g., 5-UR-110)
+        URL: https://apps.psc.wi.gov/APPS/dockets/content/detail.aspx?id={util_id}&case={case_type}&num={seq_num}
+        """
+        from playwright.async_api import async_playwright
+
+        # Parse docket number (format: UTIL_ID-CASE_TYPE-SEQ_NUM)
+        parts = docket_number.strip().upper().split('-')
+        if len(parts) != 3:
+            result.error = f"Invalid WI docket format. Expected UTIL_ID-CASE_TYPE-SEQ_NUM (e.g., 5-UR-110), got: {docket_number}"
+            return result
+
+        util_id, case_type, seq_num = parts
+        url = f"https://apps.psc.wi.gov/APPS/dockets/content/detail.aspx?id={util_id}&case={case_type}&num={seq_num}"
+        result.source_url = url
+
+        # WI reCAPTCHA sitekey (extracted from their HTML)
+        sitekey = "6LfT4aIaAAAAAKdGc0Nea5zNDsqh08eoZ9_hyHp6"
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+
+                try:
+                    logger.info(f"WI: Navigating to {url}")
+                    await page.goto(url, timeout=30000)
+                    await asyncio.sleep(2)
+
+                    # Check if we have reCAPTCHA
+                    content = await page.content()
+                    if "g-recaptcha" in content:
+                        logger.info("WI: Got reCAPTCHA challenge, solving via Capsolver...")
+
+                        # Solve reCAPTCHA
+                        token = await self._solve_recaptcha_v2_capsolver(url, sitekey)
+                        if not token:
+                            result.error = "Capsolver failed to solve reCAPTCHA"
+                            return result
+
+                        logger.info("WI: Injecting Capsolver token and submitting...")
+
+                        # Inject the token and submit the form
+                        await page.evaluate(f"""
+                            document.getElementById('g-recaptcha-response').value = '{token}';
+                        """)
+
+                        # Click the Continue button
+                        await page.click("#btn_continue")
+                        await asyncio.sleep(3)
+
+                        # Wait for content to load
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=15000)
+                        except Exception:
+                            pass
+
+                    # Get page content
+                    text = await page.inner_text("body")
+                    html = await page.content()
+                    logger.info(f"WI: Page content length: {len(text)} chars, HTML: {len(html)} chars")
+
+                    # Save HTML for debugging
+                    with open("/tmp/wi_docket.html", "w") as f:
+                        f.write(html)
+                    logger.info("WI: Saved HTML to /tmp/wi_docket.html")
+
+                    # Check if docket was found
+                    if "Invalid docket" in text or "not found" in text.lower() or len(text) < 200:
+                        result.found = False
+                        result.error = "Docket not found"
+                        return result
+
+                    result.found = True
+
+                    # WI page structure:
+                    # - #lbl_docket_title contains: "5-UR-110 (Active)\nJoint Application of..."
+                    # - #lbl_docket_summary contains applicant info
+
+                    # Extract title from lbl_docket_title
+                    try:
+                        title_el = await page.query_selector("#lbl_docket_title")
+                        if title_el:
+                            title_text = await title_el.inner_text()
+                            # Title format: "5-UR-110  (Active)\nJoint Application of..."
+                            lines = title_text.strip().split('\n')
+                            if len(lines) >= 2:
+                                # First line has docket and status
+                                first_line = lines[0].strip()
+                                # Extract status from (Active) or (Closed)
+                                status_match = re.search(r'\((Active|Closed|Open|Pending)\)', first_line, re.IGNORECASE)
+                                if status_match:
+                                    status = status_match.group(1).lower()
+                                    if status in ('active', 'open', 'pending'):
+                                        result.status = 'open'
+                                    elif status == 'closed':
+                                        result.status = 'closed'
+
+                                # Rest is the title
+                                title = '\n'.join(lines[1:]).strip()
+                                title = re.sub(r'\s+', ' ', title)
+                                if len(title) > 5:
+                                    result.title = title[:500]
+                                    logger.info(f"WI: Title: {result.title}")
+                    except Exception as e:
+                        logger.warning(f"WI: Error extracting title: {e}")
+
+                    # Extract applicant(s) from lbl_docket_summary
+                    try:
+                        summary_el = await page.query_selector("#lbl_docket_summary")
+                        if summary_el:
+                            summary_text = await summary_el.inner_text()
+                            # Look for "Applicant(s):" section
+                            applicant_match = re.search(r'Applicant\(s\):\s*(.+?)(?:Case Coordinator|$)', summary_text, re.DOTALL | re.IGNORECASE)
+                            if applicant_match:
+                                applicants = applicant_match.group(1).strip()
+                                # Clean up - remove extra whitespace and parenthetical IDs
+                                applicants = re.sub(r'\s*\(\d+\)', '', applicants)
+                                applicants = re.sub(r'\s+', ' ', applicants).strip()
+                                if len(applicants) > 2:
+                                    result.utility_name = applicants[:200]
+                                    logger.info(f"WI: Applicant: {result.utility_name}")
+                    except Exception as e:
+                        logger.warning(f"WI: Error extracting applicant: {e}")
+
+                    # Determine utility type from case type code and content
+                    case_type_upper = case_type.upper()
+                    text_lower = text.lower()
+                    if case_type_upper in ('UR', 'UE', 'ER') or 'electric' in text_lower:
+                        result.utility_type = 'Electric'
+                    if 'gas' in text_lower:
+                        if result.utility_type == 'Electric':
+                            result.utility_type = 'Electric/Gas'  # Multi-utility
+                        else:
+                            result.utility_type = 'Gas'
+                    elif case_type_upper in ('GR', 'GE'):
+                        result.utility_type = 'Gas'
+                    elif case_type_upper in ('TR', 'TE'):
+                        result.utility_type = 'Telephone'
+                    elif case_type_upper in ('WR', 'WE'):
+                        result.utility_type = 'Water'
+
+                    # Extract filing date from page if available
+                    date_match = re.search(r'(?:Filed|Filing Date|Date Filed|Open Date)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, re.IGNORECASE)
+                    if date_match:
+                        result.filing_date = self._parse_date(date_match.group(1))
+
+                    # Fallback title
+                    if not result.title:
+                        result.title = f"Wisconsin PSC Docket {docket_number}"
+
+                    return result
+
+                finally:
+                    await browser.close()
+
+        except Exception as e:
+            logger.error(f"WI scrape error: {e}")
+            result.error = f"WI scrape error: {str(e)}"
             return result
 
     async def _scrape_connecticut(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
