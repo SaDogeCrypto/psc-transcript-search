@@ -305,6 +305,10 @@ class DocketScraper:
                 return result
             return await self._scrape_wisconsin_with_capsolver(docket_number, result, None)
 
+        # Maryland - simple URL pattern, no CAPTCHA
+        if state_code == 'MD':
+            return await self._scrape_maryland(docket_number, result)
+
         # Get config (may not be in cache if not enabled)
         config = self._configs.get(state_code)
         if not config:
@@ -2178,6 +2182,114 @@ class DocketScraper:
         except Exception as e:
             logger.error(f"WI scrape error: {e}")
             result.error = f"WI scrape error: {str(e)}"
+            return result
+
+    async def _scrape_maryland(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """
+        Scrape Maryland PSC docket.
+
+        MD uses simple URL pattern: https://webpscxb.psc.state.md.us/DMS/case/{case_number}
+        No CAPTCHA required, just simple HTML scraping.
+        """
+        import re
+        import html
+
+        # Normalize docket number - should be numeric
+        docket_clean = docket_number.strip()
+        url = f"https://webpscxb.psc.state.md.us/DMS/case/{docket_clean}"
+        result.source_url = url
+
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                response = await client.get(url)
+
+                if response.status_code != 200:
+                    result.error = f"HTTP {response.status_code}"
+                    return result
+
+                text = response.text
+
+                # Check if case exists
+                if "Case Number :" not in text:
+                    result.found = False
+                    result.error = "Docket not found"
+                    return result
+
+                result.found = True
+
+                # Extract case number (verify)
+                case_match = re.search(r'Case Number\s*:\s*(\d+)', text)
+                if case_match:
+                    result.docket_number = case_match.group(1)
+
+                # Extract filing date
+                date_match = re.search(r'Date Filed\s*:\s*(\d{2}/\d{2}/\d{4})', text)
+                if date_match:
+                    result.filing_date = self._parse_date(date_match.group(1))
+
+                # Extract title from HTML
+                # Primary: Look for the case caption element (ContentPlaceHolder1_hCaseCaption)
+                caption_match = re.search(
+                    r'id="ContentPlaceHolder1_hCaseCaption"[^>]*>([^<]+)<',
+                    text, re.IGNORECASE
+                )
+                if caption_match:
+                    result.title = html.unescape(caption_match.group(1).strip())
+                else:
+                    # Fallback: look for company + Application pattern in any element
+                    title_match = re.search(
+                        r">([A-Z][^<]*(?:Company|Corporation|Inc\.|LLC|L\.L\.C\.|LP|L\.P\.)[^<]*'s\s+(?:Application|Petition|Complaint|Request)[^<]*)<",
+                        text, re.IGNORECASE
+                    )
+                    if title_match:
+                        result.title = html.unescape(title_match.group(1).strip())
+                    else:
+                        # Last fallback: look for longer Application text that contains possessive
+                        app_matches = re.findall(r'>([^<]*(?:Application|Petition|Complaint|Request)[^<]*)<', text, re.IGNORECASE)
+                        for match in app_matches:
+                            clean = html.unescape(match.strip())
+                            # Real titles are longer and contain possessive ('s)
+                            if len(clean) > 40 and "'s " in clean and not clean.startswith("$("):
+                                result.title = clean
+                                break
+
+                # Extract company from title - look for "Company's Application" pattern
+                # Handle both regular apostrophe (') and fancy apostrophe (U+2019)
+                if result.title and ("'s " in result.title or "\u2019s " in result.title):
+                    company_match = re.match(r"(.+?)['\u2019]s\s+(?:Application|Petition|Complaint|Request)", result.title, re.IGNORECASE)
+                    if company_match:
+                        result.utility_name = company_match.group(1).strip()
+
+                # Determine utility type from title
+                title_lower = (result.title or "").lower()
+                if "electric" in title_lower and "gas" in title_lower:
+                    result.utility_type = "Electric/Gas"
+                elif "electric" in title_lower:
+                    result.utility_type = "Electric"
+                elif "gas" in title_lower:
+                    result.utility_type = "Gas"
+                elif "water" in title_lower:
+                    result.utility_type = "Water"
+                elif "solar" in title_lower or "photovoltaic" in title_lower:
+                    result.utility_type = "Electric"
+                elif "telecom" in title_lower or "telephone" in title_lower:
+                    result.utility_type = "Telephone"
+
+                # Determine docket type from title
+                if "rate" in title_lower:
+                    result.docket_type = "Rate Case"
+                elif "certificate" in title_lower or "cpcn" in title_lower:
+                    result.docket_type = "Certificate"
+                elif "merger" in title_lower or "acquisition" in title_lower:
+                    result.docket_type = "Merger"
+                elif "complaint" in title_lower:
+                    result.docket_type = "Complaint"
+
+                return result
+
+        except Exception as e:
+            logger.error(f"MD scrape error: {e}")
+            result.error = f"MD scrape error: {str(e)}"
             return result
 
     async def _scrape_connecticut(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
