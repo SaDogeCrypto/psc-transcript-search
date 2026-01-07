@@ -11,6 +11,7 @@ import re
 import httpx
 import asyncio
 import logging
+import uuid
 from datetime import datetime, date
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field, asdict
@@ -107,6 +108,86 @@ class DocketScraper:
         """Get configuration for a state."""
         return self._configs.get(state_code)
 
+    async def _solve_turnstile_capsolver(self, website_url: str, sitekey: str) -> Optional[str]:
+        """
+        Solve Cloudflare Turnstile CAPTCHA using Capsolver API.
+
+        Args:
+            website_url: The URL of the page with the Turnstile
+            sitekey: The Turnstile sitekey (data-sitekey attribute)
+
+        Returns:
+            The solved token, or None if solving failed
+        """
+        settings = get_settings()
+        if not settings.capsolver.enabled or not settings.capsolver.api_key:
+            logger.warning("Capsolver not configured")
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                # Create task
+                create_payload = {
+                    "clientKey": settings.capsolver.api_key,
+                    "task": {
+                        "type": "AntiTurnstileTaskProxyLess",
+                        "websiteKey": sitekey,
+                        "websiteURL": website_url
+                    }
+                }
+
+                logger.info(f"Capsolver: Creating Turnstile task for {website_url}")
+                create_resp = await client.post(
+                    f"{settings.capsolver.api_url}/createTask",
+                    json=create_payload
+                )
+                create_data = create_resp.json()
+
+                if create_data.get("errorId", 0) != 0:
+                    logger.error(f"Capsolver createTask error: {create_data.get('errorDescription')}")
+                    return None
+
+                task_id = create_data.get("taskId")
+                if not task_id:
+                    logger.error("Capsolver: No taskId in response")
+                    return None
+
+                logger.info(f"Capsolver: Task created, ID={task_id}")
+
+                # Poll for result (max 120 seconds)
+                max_polls = 40  # 40 * 3s = 120s
+                for i in range(max_polls):
+                    await asyncio.sleep(3)
+
+                    result_payload = {
+                        "clientKey": settings.capsolver.api_key,
+                        "taskId": task_id
+                    }
+                    result_resp = await client.post(
+                        f"{settings.capsolver.api_url}/getTaskResult",
+                        json=result_payload
+                    )
+                    result_data = result_resp.json()
+
+                    status = result_data.get("status")
+                    if status == "ready":
+                        token = result_data.get("solution", {}).get("token")
+                        logger.info(f"Capsolver: Turnstile solved after {(i+1)*3}s")
+                        return token
+                    elif status == "failed":
+                        logger.error(f"Capsolver: Task failed: {result_data.get('errorDescription')}")
+                        return None
+
+                    if i % 5 == 0:
+                        logger.info(f"Capsolver: Still processing... ({(i+1)*3}s)")
+
+                logger.error("Capsolver: Timeout waiting for solution")
+                return None
+
+        except Exception as e:
+            logger.error(f"Capsolver error: {e}")
+            return None
+
     async def scrape_docket(self, state_code: str, docket_number: str) -> ScrapedDocket:
         """
         Scrape docket metadata from a state PSC website.
@@ -139,8 +220,19 @@ class DocketScraper:
             result.error = f"No detail URL template for {state_code}"
             return result
 
+        # Minnesota uses Cloudflare Turnstile - needs Playwright + Capsolver
+        if state_code == 'MN':
+            settings = get_settings()
+            if not settings.capsolver.enabled:
+                result.error = "MN requires Capsolver for Turnstile - set CAPSOLVER_API_KEY and USE_CAPSOLVER=true"
+                return result
+            if not PLAYWRIGHT_AVAILABLE:
+                result.error = "Playwright not installed - required for MN scraping"
+                return result
+            return await self._scrape_minnesota_with_capsolver(docket_number, result, config)
+
         # States that require Playwright for JavaScript rendering / bot protection
-        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI', 'KS', 'MN')
+        playwright_states = ('FL', 'OH', 'NY', 'CA', 'AZ', 'MI', 'KS')
         if state_code in playwright_states:
             if not PLAYWRIGHT_AVAILABLE:
                 result.error = f"Playwright not installed - required for {state_code} scraping"
@@ -368,19 +460,32 @@ class DocketScraper:
             settings = get_settings()
 
             async with async_playwright() as p:
-                # States with government sites that have Shape Security (need residential proxy)
-                shape_security_states = ('OH',)
+                # States with government sites that have bot protection (need residential proxy)
+                # OH: Shape Security (residential proxy works)
+                residential_proxy_states = ('OH',)
+
+                # States that need Bright Data Scraping Browser for CAPTCHA/bot protection
+                # (MN now uses Capsolver for Turnstile instead)
+                scraping_browser_states = ()
 
                 # Check if residential proxy is available for Shape Security sites
                 use_residential = (
-                    state_code in shape_security_states
+                    state_code in residential_proxy_states
                     and settings.brightdata.residential_enabled
                     and settings.brightdata.residential_proxy_config
                 )
 
-                # Check if we should use Bright Data Browser API (not for gov sites)
+                # Check if we should use Bright Data Scraping Browser (has CAPTCHA solving)
+                use_scraping_browser = (
+                    state_code in scraping_browser_states
+                    and settings.brightdata.browser_enabled
+                    and settings.brightdata.browser_ws
+                )
+
+                # Check if we should use Bright Data Browser API for other proxy states
                 use_brightdata_browser = (
-                    state_code not in shape_security_states
+                    state_code not in residential_proxy_states
+                    and state_code not in scraping_browser_states
                     and state_code in settings.scraper.proxy_states
                     and settings.brightdata.browser_enabled
                     and settings.brightdata.browser_ws
@@ -414,6 +519,18 @@ class DocketScraper:
                         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                         window.chrome = { runtime: {} };
                     """)
+                elif use_scraping_browser:
+                    # Connect to Bright Data Scraping Browser (has CAPTCHA solving built-in)
+                    # Add random session ID to force fresh connection each time
+                    session_id = str(uuid.uuid4())[:8]
+                    ws_url = settings.brightdata.browser_ws
+                    # Append session parameter to WebSocket URL
+                    separator = "&" if "?" in ws_url else "?"
+                    ws_url_with_session = f"{ws_url}{separator}session={session_id}"
+                    logger.info(f"Using Bright Data Scraping Browser for {state_code} (session={session_id})")
+                    browser = await p.chromium.connect_over_cdp(ws_url_with_session)
+                    context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                    page = await context.new_page()
                 elif use_brightdata_browser:
                     # Connect to Bright Data's remote browser via CDP (non-government sites)
                     logger.info(f"Using Bright Data Browser API for {state_code}")
@@ -1209,8 +1326,207 @@ class DocketScraper:
             result.error = f"KS scrape error: {str(e)}"
             return result
 
+    async def _scrape_minnesota_with_capsolver(self, docket_number: str, result: ScrapedDocket, config: Dict) -> ScrapedDocket:
+        """Scrape Minnesota PUC eDockets using Playwright + Capsolver for Turnstile.
+
+        MN uses Cloudflare Turnstile protection that blocks HTTP requests.
+        We use Playwright to load the page and Capsolver to solve Turnstile:
+        1. Navigate to docket page with Playwright (gets Turnstile challenge)
+        2. Extract sitekey from the challenge page
+        3. Solve Turnstile via Capsolver API
+        4. Inject the solved token and submit
+        5. Parse the resulting documents page
+
+        Docket format: YY-NNN (e.g., 22-221) or full format with year prefix.
+        """
+        docket_clean = docket_number.strip()
+        url = f"https://www.edockets.state.mn.us/documents?docketNumber={docket_clean}"
+        result.source_url = url
+
+        # MN Turnstile sitekey (extracted from their HTML)
+        TURNSTILE_SITEKEY = "0x4AAAAAAASEWWvJ44aXE1FF"
+
+        try:
+            settings = get_settings()
+
+            async with async_playwright() as p:
+                # Launch browser with stealth settings
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                    ]
+                )
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                )
+                page = await context.new_page()
+
+                # Anti-detection
+                await page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    window.chrome = { runtime: {} };
+                """)
+
+                try:
+                    # Navigate to docket page
+                    logger.info(f"MN: Navigating to {url}")
+                    await page.goto(url, timeout=60000, wait_until="load")
+
+                    # Check if we're on Turnstile page
+                    current_url = page.url
+                    page_content = await page.content()
+
+                    if "/turnstile" in current_url or "Security check" in page_content:
+                        logger.info("MN: Got Turnstile challenge, solving via Capsolver...")
+
+                        # Extract sitekey from page (verify it matches)
+                        sitekey_match = re.search(r'data-sitekey="([^"]+)"', page_content)
+                        sitekey = sitekey_match.group(1) if sitekey_match else TURNSTILE_SITEKEY
+
+                        # Solve Turnstile via Capsolver
+                        token = await self._solve_turnstile_capsolver(current_url, sitekey)
+
+                        if not token:
+                            result.error = "Capsolver failed to solve Turnstile"
+                            return result
+
+                        # Inject the token and submit the form
+                        logger.info("MN: Injecting Capsolver token and submitting...")
+
+                        # The Turnstile form expects cf-turnstile-response field
+                        # Either find existing field or create one, then submit
+                        await page.evaluate(f"""
+                            (function() {{
+                                const form = document.getElementById('turnstile-form');
+                                if (!form) {{
+                                    console.error('Form not found');
+                                    return;
+                                }}
+
+                                // Check for existing turnstile response field
+                                let responseField = form.querySelector('input[name="cf-turnstile-response"]');
+                                if (!responseField) {{
+                                    responseField = document.createElement('input');
+                                    responseField.type = 'hidden';
+                                    responseField.name = 'cf-turnstile-response';
+                                    form.appendChild(responseField);
+                                }}
+                                responseField.value = '{token}';
+
+                                // Also try setting turnstile-response (alternate name)
+                                let altField = form.querySelector('input[name="turnstile-response"]');
+                                if (!altField) {{
+                                    altField = document.createElement('input');
+                                    altField.type = 'hidden';
+                                    altField.name = 'turnstile-response';
+                                    form.appendChild(altField);
+                                }}
+                                altField.value = '{token}';
+
+                                // Submit the form
+                                form.submit();
+                            }})();
+                        """)
+
+                        # Wait for navigation after form submission
+                        try:
+                            await page.wait_for_load_state("load", timeout=30000)
+                        except Exception as nav_err:
+                            logger.warning(f"MN: Navigation wait error: {nav_err}")
+                        await asyncio.sleep(3)
+
+                        # Check if we passed Turnstile
+                        current_url = page.url
+                        page_text = await page.inner_text("body")
+                        logger.info(f"MN: After submit - URL: {current_url}, content length: {len(page_text)}")
+                        logger.info(f"MN: Page preview: {page_text[:300]}")
+
+                        if "/turnstile" in current_url and "Security check" in page_text:
+                            result.error = "Turnstile submission failed - still on challenge page"
+                            return result
+
+                        logger.info(f"MN: Passed Turnstile, now at: {current_url}")
+
+                    # Now we should be on the documents page
+                    result.source_url = page.url
+                    text = await page.inner_text("body")
+                    logger.info(f"MN: Page content length: {len(text)} chars")
+
+                    # Check if docket was found
+                    if "No results found" in text or "No documents found" in text:
+                        result.found = False
+                        result.error = "Docket not found"
+                        return result
+
+                    # Check for 403 or other errors
+                    if "403 Forbidden" in text or len(text) < 100:
+                        result.found = False
+                        result.error = "Access denied or empty page"
+                        return result
+
+                    # Look for docket reference
+                    has_content = "eDockets" in text or "Document" in text or docket_clean in text
+                    if not has_content:
+                        result.found = False
+                        result.error = "Page loaded but no docket content found"
+                        logger.warning(f"MN: Page preview: {text[:500]}")
+                        return result
+
+                    result.found = True
+
+                    # Extract docket title
+                    title_patterns = [
+                        r'(?:Title|Caption|Subject)[:\s]*([^\n]+)',
+                        r'In the [Mm]atter of[:\s]*([^\n]+)',
+                    ]
+                    for pattern in title_patterns:
+                        match = re.search(pattern, text, re.IGNORECASE)
+                        if match:
+                            title = match.group(1).strip()
+                            title = re.sub(r'\s+', ' ', title)
+                            if len(title) > 10:
+                                result.title = title[:500]
+                                break
+
+                    # Extract company name
+                    company_patterns = [
+                        r'(Xcel Energy|Minnesota Power|Otter Tail Power|Great Plains|CenterPoint|MERC)',
+                        r'(?:Company|Utility)[:\s]*([A-Z][a-zA-Z\s,\.]+(?:Inc\.|LLC|Company|Corp\.))',
+                    ]
+                    for pattern in company_patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            result.utility_name = match.group(1).strip()[:200]
+                            break
+
+                    # Determine utility type
+                    text_lower = text.lower()
+                    if 'electric' in text_lower or 'power' in text_lower:
+                        result.utility_type = 'Electric'
+                    elif 'gas' in text_lower:
+                        result.utility_type = 'Gas'
+                    elif 'telecom' in text_lower or 'telephone' in text_lower:
+                        result.utility_type = 'Telephone'
+
+                    # Fallback title
+                    if not result.title:
+                        result.title = f"Minnesota PUC Docket {docket_clean}"
+
+                    return result
+
+                finally:
+                    await browser.close()
+
+        except Exception as e:
+            result.error = f"MN scrape error: {str(e)}"
+            return result
+
     async def _scrape_minnesota_playwright(self, page, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
-        """Scrape Minnesota PUC eDockets using Playwright.
+        """Scrape Minnesota PUC eDockets using Playwright (deprecated - use Capsolver instead).
 
         MN uses Cloudflare Turnstile protection that requires browser automation.
         Docket format: YY-NNN (e.g., 22-221) or full format with year prefix.
@@ -1221,50 +1537,107 @@ class DocketScraper:
         result.source_url = url
 
         try:
-            # Navigate to the docket page - Turnstile will auto-solve in headless
-            await page.goto(url, timeout=60000)
+            # Navigate to docket search
+            logger.info(f"MN: Navigating to docket search for {docket_clean}")
 
-            # Wait for potential Turnstile challenge to auto-complete
-            await asyncio.sleep(8)
+            # Get CDP session for manual CAPTCHA control
+            cdp_session = await page.context.new_cdp_session(page)
 
-            # Check if we're still on the security check page
-            page_title = await page.title()
-            max_retries = 3
-            retry_count = 0
-            while "Security check" in page_title and retry_count < max_retries:
-                # Wait longer for Turnstile to complete
-                await asyncio.sleep(5)
-                page_title = await page.title()
-                retry_count += 1
+            # Go to page
+            await page.goto(url, timeout=60000, wait_until="load")
+            logger.info(f"MN: Initial page loaded, current URL: {page.url}")
 
-            # Try waiting for page content to load
-            try:
-                await page.wait_for_selector("body", timeout=10000)
-            except Exception:
-                pass
+            # Wait for Turnstile to be solved (Bright Data Scraping Browser should handle this)
+            # The Turnstile challenge may redirect to efiling.web.commerce.state.mn.us/turnstile
+            # We need to wait for it to redirect back to the documents page
+            logger.info("MN: Waiting for Turnstile to be solved...")
+            max_wait = 45  # 45 seconds per attempt (retries at higher level)
+            wait_interval = 3
+            elapsed = 0
+            captcha_solve_triggered = False
+
+            while elapsed < max_wait:
+                current_url = page.url
+                # Check if we're past the turnstile
+                if "/turnstile" not in current_url and "security" not in current_url.lower():
+                    logger.info(f"MN: Passed Turnstile after {elapsed}s, now at: {current_url}")
+                    break
+
+                # If we're still on turnstile after 10 seconds, try clicking the Turnstile checkbox
+                if elapsed >= 10 and not captcha_solve_triggered:
+                    try:
+                        logger.info("MN: Attempting to click Turnstile checkbox...")
+                        # Turnstile renders in an iframe - try to find and click it
+                        turnstile_frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+                        checkbox = turnstile_frame.locator('input[type="checkbox"], .cf-turnstile-checkbox, div[role="checkbox"]')
+                        if await checkbox.count() > 0:
+                            await checkbox.first.click(timeout=5000)
+                            logger.info("MN: Clicked Turnstile checkbox")
+                        else:
+                            # Try clicking on the turnstile div itself
+                            turnstile_div = page.locator('.cf-turnstile, [data-sitekey]')
+                            if await turnstile_div.count() > 0:
+                                await turnstile_div.first.click(timeout=5000)
+                                logger.info("MN: Clicked Turnstile div")
+                        captcha_solve_triggered = True
+                    except Exception as e:
+                        logger.debug(f"MN: Could not click Turnstile: {e}")
+                        # Fallback: try CDP Captcha.solve
+                        try:
+                            await cdp_session.send('Captcha.solve', {'detectTimeout': 30000})
+                        except Exception:
+                            pass
+
+                # Check page content
+                try:
+                    page_text = await page.inner_text("body", timeout=5000)
+                    if "Security check" not in page_text and "verify your browser" not in page_text.lower():
+                        logger.info(f"MN: Turnstile content cleared after {elapsed}s")
+                        break
+                except Exception:
+                    pass  # Page may be navigating
+                await asyncio.sleep(wait_interval)
+                elapsed += wait_interval
+                logger.info(f"MN: Still waiting for Turnstile ({elapsed}s), URL: {current_url}")
+
+            if elapsed >= max_wait:
+                result.found = False
+                result.error = "Timeout waiting for Cloudflare Turnstile to complete"
+                return result
+
+            # Give page time to fully load after Turnstile redirect
+            await asyncio.sleep(3)
+            logger.info(f"MN: Final page URL: {page.url}")
 
             # Update URL after any redirects
             result.source_url = page.url
 
-            # Get page content
+            # Get page content (fresh read after Turnstile)
             text = await page.inner_text("body")
+            logger.info(f"MN: Page content length: {len(text)} chars")
+            logger.debug(f"MN: Page content preview: {text[:500]}")
 
-            # Check if docket was found
-            if "No documents found" in text or "not found" in text.lower():
-                result.found = False
-                result.error = "Docket not found"
-                return result
-
-            # Check if we're still blocked
+            # Check if we're still blocked (shouldn't happen after wait loop, but check anyway)
             if "Security check" in text or "verify your browser" in text.lower():
                 result.found = False
                 result.error = "Blocked by Cloudflare Turnstile"
                 return result
 
-            # Check if docket number appears in results
-            if docket_clean not in text and docket_clean.replace("-", "") not in text:
+            # Check if docket was found - MN shows "No results found" for invalid dockets
+            if "No results found" in text or "No documents found" in text:
                 result.found = False
-                result.error = "Docket not found in results"
+                result.error = "Docket not found"
+                return result
+
+            # Look for document results - MN eDockets shows a table with document listings
+            # If we see "eDockets" in the page and no error message, we likely have results
+            has_edockets = "eDockets" in text or "Document" in text
+            has_docket_ref = docket_clean in text or docket_clean.replace("-", "") in text
+
+            if not has_edockets and not has_docket_ref:
+                result.found = False
+                result.error = f"Page loaded but no docket results found"
+                logger.warning(f"MN: Page text preview: {text[:1000]}")
                 return result
 
             result.found = True

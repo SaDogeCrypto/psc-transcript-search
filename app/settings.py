@@ -7,6 +7,23 @@ from typing import Optional
 
 
 @dataclass
+class CapsolverSettings:
+    """Capsolver CAPTCHA solving service configuration."""
+    api_key: Optional[str] = None
+    api_url: str = "https://api.capsolver.com"
+    enabled: bool = False
+
+    @classmethod
+    def from_env(cls) -> "CapsolverSettings":
+        """Load settings from environment variables."""
+        return cls(
+            api_key=os.getenv("CAPSOLVER_API_KEY"),
+            api_url=os.getenv("CAPSOLVER_API_URL", "https://api.capsolver.com"),
+            enabled=os.getenv("USE_CAPSOLVER", "false").lower() == "true",
+        )
+
+
+@dataclass
 class BrowserlessSettings:
     """Browserless.io configuration for headless browser scraping."""
     api_key: Optional[str] = None
@@ -114,6 +131,7 @@ class Settings:
         self.browserless = BrowserlessSettings.from_env()
         self.brightdata = BrightDataSettings.from_env()
         self.scraper = ScraperSettings.from_env()
+        self.capsolver = CapsolverSettings.from_env()
 
     @classmethod
     def get(cls) -> "Settings":
