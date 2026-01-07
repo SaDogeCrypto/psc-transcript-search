@@ -102,14 +102,14 @@ STATE_DOCKET_RULES = {
     },
     "FL": {
         "patterns": [
-            (r'\b(\d{8}-[A-Z]{2})\b', "YYYYNNNN-XX format"),
-            (r'\b(20\d{2}\d{4}-[A-Z]{2})\b', "Full Florida format"),
+            (r'\b(20\d{2}-\d{4}-[A-Z]{2})\b', "YYYY-NNNN-XX format (e.g., 2024-0190-EI)"),
+            (r'\b(\d{8}-[A-Z]{2})\b', "YYYYNNNN-XX format (e.g., 20240190-EI)"),
         ],
         "validators": [
-            ("format", lambda x: bool(re.match(r'^\d{8}-[A-Z]{2}$', x)), "Must match YYYYNNNN-XX"),
+            ("format", lambda x: bool(re.match(r'^20\d{2}-?\d{4}-[A-Z]{2}$', x)), "Must match FL docket format"),
             ("year", lambda x: 2000 <= int(x[:4]) <= 2030 if len(x) >= 4 else False, "Year must be 2000-2030"),
         ],
-        "description": "YYYYNNNN-XX (e.g., 20250035-GU)",
+        "description": "YYYY-NNNN-XX (e.g., 2024-0190-EI)",
     },
     "CA": {
         "patterns": [
