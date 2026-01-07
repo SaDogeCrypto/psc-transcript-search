@@ -1340,7 +1340,8 @@ class DocketScraper:
         Docket format: YY-NNN (e.g., 22-221) or full format with year prefix.
         """
         docket_clean = docket_number.strip()
-        url = f"https://www.edockets.state.mn.us/documents?docketNumber={docket_clean}"
+        # doSearch=true is required to trigger the actual search and load results
+        url = f"https://www.edockets.state.mn.us/documents?docketNumber={docket_clean}&doSearch=true"
         result.source_url = url
 
         # MN Turnstile sitekey (extracted from their HTML)
@@ -1453,8 +1454,72 @@ class DocketScraper:
 
                     # Now we should be on the documents page
                     result.source_url = page.url
+
+                    # After Turnstile, we land on search form but the docket number field may be empty
+                    # Need to fill in the docket number and trigger the search
+                    try:
+                        # Check if results are already loaded
+                        results_present = await page.query_selector("#docketLookupTableBody tr")
+                        if not results_present:
+                            logger.info("MN: No results yet, triggering search...")
+
+                            # Fill in the docket number field (it may be empty after Turnstile)
+                            docket_input = await page.query_selector("#docket, input[name='dockets']")
+                            if docket_input:
+                                # Clear and fill the field
+                                await docket_input.fill("")
+                                await docket_input.fill(docket_clean)
+                                logger.info(f"MN: Filled docket input with: {docket_clean}")
+
+                            # Click the Search submit button (main form, not the Lookup modal button)
+                            search_btn = await page.query_selector("input[type='submit'][value='Search']")
+                            if search_btn:
+                                logger.info("MN: Clicking Search button...")
+                                await search_btn.click()
+                                await page.wait_for_load_state("networkidle", timeout=15000)
+                            else:
+                                # Try form submission directly
+                                logger.info("MN: No Search button found, submitting form...")
+                                await page.evaluate(f"""
+                                    const input = document.querySelector('#docket, input[name="dockets"]');
+                                    if (input) input.value = '{docket_clean}';
+                                    const form = document.querySelector('form');
+                                    if (form) form.submit();
+                                """)
+                                await page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception as search_err:
+                        logger.warning(f"MN: Error triggering search: {search_err}")
+
+                    # Wait for JavaScript content to load
+                    logger.info("MN: Waiting for page content to load...")
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass  # Continue anyway
+
+                    # Wait for document results table to have content
+                    try:
+                        await page.wait_for_selector("#documentTable tbody tr", timeout=15000)
+                        logger.info("MN: Results table populated")
+                    except Exception:
+                        logger.info("MN: No results rows found, trying alternative selectors...")
+                        try:
+                            await page.wait_for_selector("table.table tbody tr", timeout=5000)
+                        except Exception:
+                            pass
+
+                    # Additional wait for dynamic content to stabilize
+                    await asyncio.sleep(2)
+
+                    # Get page text and HTML for parsing
                     text = await page.inner_text("body")
-                    logger.info(f"MN: Page content length: {len(text)} chars")
+                    html = await page.content()
+                    logger.info(f"MN: Page content length: {len(text)} chars, HTML: {len(html)} chars")
+
+                    # Save HTML for debugging (temporary)
+                    with open("/tmp/mn_page.html", "w") as f:
+                        f.write(html)
+                    logger.info("MN: Saved HTML to /tmp/mn_page.html")
 
                     # Check if docket was found
                     if "No results found" in text or "No documents found" in text:
@@ -1466,6 +1531,7 @@ class DocketScraper:
                     if "403 Forbidden" in text or len(text) < 100:
                         result.found = False
                         result.error = "Access denied or empty page"
+                        logger.warning(f"MN: Short content: {text}")
                         return result
 
                     # Look for docket reference
@@ -1473,44 +1539,177 @@ class DocketScraper:
                     if not has_content:
                         result.found = False
                         result.error = "Page loaded but no docket content found"
-                        logger.warning(f"MN: Page preview: {text[:500]}")
+                        logger.warning(f"MN: Page preview: {text[:1000]}")
                         return result
 
                     result.found = True
 
-                    # Extract docket title
-                    title_patterns = [
-                        r'(?:Title|Caption|Subject)[:\s]*([^\n]+)',
-                        r'In the [Mm]atter of[:\s]*([^\n]+)',
-                    ]
-                    for pattern in title_patterns:
-                        match = re.search(pattern, text, re.IGNORECASE)
-                        if match:
-                            title = match.group(1).strip()
-                            title = re.sub(r'\s+', ' ', title)
-                            if len(title) > 10:
-                                result.title = title[:500]
+                    # MN document search shows documents, not docket metadata
+                    # Extract what we can from the document table
+                    try:
+                        rows = await page.query_selector_all("#documentTable tbody tr")
+                        if rows:
+                            logger.info(f"MN: Found {len(rows)} document rows")
+
+                            # Get document types and dates from first few rows
+                            doc_types = set()
+                            dates = []
+                            for i, row in enumerate(rows[:5]):  # Check first 5 rows
+                                try:
+                                    # Document type is in td.edockets.document-type
+                                    doc_type_el = await row.query_selector("td.document-type")
+                                    if doc_type_el:
+                                        doc_type = await doc_type_el.inner_text()
+                                        if doc_type:
+                                            doc_types.add(doc_type.strip())
+
+                                    # Received date is in td.edockets.received-date
+                                    date_el = await row.query_selector("td.received-date")
+                                    if date_el:
+                                        date_text = await date_el.inner_text()
+                                        if date_text:
+                                            dates.append(date_text.strip())
+
+                                    # Docket ID and type info
+                                    docket_id_el = await row.query_selector("td.docket-id span")
+                                    if docket_id_el and not result.utility_type:
+                                        docket_info = await docket_id_el.inner_text()
+                                        # Check docket format for utility type hints
+                                        # E=Electric, G=Gas, P=Telecom based on MN format
+                                        if '(E)' in docket_info or docket_info.startswith('E'):
+                                            result.utility_type = 'Electric'
+                                        elif '(G)' in docket_info or docket_info.startswith('G'):
+                                            result.utility_type = 'Gas'
+                                        elif '(P)' in docket_info:
+                                            result.utility_type = 'Telephone'
+                                except Exception:
+                                    continue
+
+                            # Use document types and date info for title
+                            if doc_types:
+                                doc_types_str = ', '.join(sorted(doc_types))
+                                logger.info(f"MN: Document types: {doc_types_str}")
+                            if dates:
+                                logger.info(f"MN: Latest received date: {dates[0]}")
+                                # Parse MM/DD/YYYY format
+                                try:
+                                    result.filing_date = datetime.strptime(dates[0], "%m/%d/%Y").date()
+                                except ValueError:
+                                    pass
+                    except Exception as table_err:
+                        logger.warning(f"MN: Error parsing document table: {table_err}")
+
+                    # Try to get docket metadata from Lookup modal
+                    # This provides the docket description and regulated utilities
+                    try:
+                        # Click Lookup button to open modal
+                        lookup_btn = await page.query_selector("button[data-bs-target='#docketLookup']")
+                        if lookup_btn:
+                            logger.info("MN: Opening docket lookup modal...")
+                            await lookup_btn.click()
+                            await asyncio.sleep(1)
+
+                            # Parse docket number (format: YY-NNN -> year=20YY, number=NNN)
+                            docket_parts = docket_clean.split('-')
+                            if len(docket_parts) >= 2:
+                                year_suffix = docket_parts[0]
+                                docket_num = docket_parts[1]
+                                # Convert 2-digit year to 4-digit (22 -> 2022)
+                                full_year = f"20{year_suffix}" if len(year_suffix) == 2 else year_suffix
+
+                                # Select year in dropdown
+                                year_select = await page.query_selector("#docketLookupYear")
+                                if year_select:
+                                    await year_select.select_option(value=full_year)
+                                    logger.info(f"MN: Selected year: {full_year}")
+
+                                # Fill in docket number
+                                modal_input = await page.query_selector("#docketLookupNumber")
+                                if modal_input:
+                                    await modal_input.fill(docket_num)
+                                    logger.info(f"MN: Filled modal docket number: {docket_num}")
+
+                                # Click modal Search button
+                                modal_search = await page.query_selector("#docketLookup input[type='submit'][value='Search']")
+                                if modal_search:
+                                    await modal_search.click()
+                                    logger.info("MN: Clicked modal Search button")
+
+                                    # Wait for results in modal table
+                                    try:
+                                        await page.wait_for_selector("#docketLookupTableBody tr", timeout=10000)
+                                        logger.info("MN: Modal results loaded")
+
+                                        # Extract data from modal table
+                                        modal_rows = await page.query_selector_all("#docketLookupTableBody tr")
+                                        if modal_rows:
+                                            first_row = modal_rows[0]
+                                            cells = await first_row.query_selector_all("td")
+                                            if len(cells) >= 5:
+                                                # Column 2: Full Docket # (e.g., "M-22-221")
+                                                full_docket = await cells[1].inner_text()
+                                                if full_docket:
+                                                    full_docket = full_docket.strip()
+                                                    logger.info(f"MN: Full docket: {full_docket}")
+                                                    # Extract utility type from prefix
+                                                    if full_docket.startswith('E'):
+                                                        result.utility_type = 'Electric'
+                                                    elif full_docket.startswith('G'):
+                                                        result.utility_type = 'Gas'
+                                                    elif full_docket.startswith('P'):
+                                                        result.utility_type = 'Telephone'
+
+                                                # Column 3: Type (docket category)
+                                                docket_type = await cells[2].inner_text()
+                                                if docket_type:
+                                                    docket_type = docket_type.strip()
+                                                    logger.info(f"MN: Docket type: {docket_type}")
+
+                                                # Column 4: Description (title)
+                                                description = await cells[3].inner_text()
+                                                if description:
+                                                    description = description.strip()
+                                                    description = re.sub(r'\s+', ' ', description)
+                                                    if len(description) > 5:
+                                                        result.title = description[:500]
+                                                        logger.info(f"MN: Docket title: {result.title[:100]}...")
+
+                                                # Column 5: Regulated Utilities
+                                                utilities = await cells[4].inner_text()
+                                                if utilities:
+                                                    utilities = utilities.strip()
+                                                    if len(utilities) > 2:
+                                                        result.utility_name = utilities[:200]
+                                                        logger.info(f"MN: Utility: {result.utility_name}")
+                                    except Exception as modal_wait_err:
+                                        logger.info(f"MN: Modal results not loaded: {modal_wait_err}")
+                    except Exception as modal_err:
+                        logger.warning(f"MN: Error with lookup modal: {modal_err}")
+
+                    # Fallback to text-based extraction if table parsing failed
+                    if not result.title:
+                        title_patterns = [
+                            r'(?:Title|Caption|Subject)[:\s]*([^\n]+)',
+                            r'In the [Mm]atter of[:\s]*([^\n]+)',
+                        ]
+                        for pattern in title_patterns:
+                            match = re.search(pattern, text, re.IGNORECASE)
+                            if match:
+                                title = match.group(1).strip()
+                                title = re.sub(r'\s+', ' ', title)
+                                if len(title) > 10:
+                                    result.title = title[:500]
+                                    break
+
+                    if not result.utility_name:
+                        company_patterns = [
+                            r'(Xcel Energy|Minnesota Power|Otter Tail Power|Great Plains|CenterPoint|MERC)',
+                        ]
+                        for pattern in company_patterns:
+                            match = re.search(pattern, text)
+                            if match:
+                                result.utility_name = match.group(1).strip()[:200]
                                 break
-
-                    # Extract company name
-                    company_patterns = [
-                        r'(Xcel Energy|Minnesota Power|Otter Tail Power|Great Plains|CenterPoint|MERC)',
-                        r'(?:Company|Utility)[:\s]*([A-Z][a-zA-Z\s,\.]+(?:Inc\.|LLC|Company|Corp\.))',
-                    ]
-                    for pattern in company_patterns:
-                        match = re.search(pattern, text)
-                        if match:
-                            result.utility_name = match.group(1).strip()[:200]
-                            break
-
-                    # Determine utility type
-                    text_lower = text.lower()
-                    if 'electric' in text_lower or 'power' in text_lower:
-                        result.utility_type = 'Electric'
-                    elif 'gas' in text_lower:
-                        result.utility_type = 'Gas'
-                    elif 'telecom' in text_lower or 'telephone' in text_lower:
-                        result.utility_type = 'Telephone'
 
                     # Fallback title
                     if not result.title:
