@@ -309,6 +309,10 @@ class DocketScraper:
         if state_code == 'MD':
             return await self._scrape_maryland(docket_number, result)
 
+        # Virginia - REST API available
+        if state_code == 'VA':
+            return await self._scrape_virginia(docket_number, result)
+
         # Get config (may not be in cache if not enabled)
         config = self._configs.get(state_code)
         if not config:
@@ -2290,6 +2294,103 @@ class DocketScraper:
         except Exception as e:
             logger.error(f"MD scrape error: {e}")
             result.error = f"MD scrape error: {str(e)}"
+            return result
+
+    async def _scrape_virginia(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
+        """
+        Scrape Virginia SCC docket using their REST API.
+
+        VA docket format: XXX-XXXX-XXXXX (e.g., PUR-2024-00001)
+        Division codes: PUR (Public Utility Regulation), CLK, BFI, INS, PST, SEC, URS
+        API endpoint: https://www.scc.virginia.gov/docketsearchapi/breeze/cases_estabdate/getcasesestdate
+        """
+        # Normalize docket number
+        docket_clean = docket_number.strip().upper()
+        result.source_url = f"https://www.scc.virginia.gov/docketsearch#/caseDetails/{docket_clean}"
+
+        try:
+            # Use the REST API to search for the case
+            api_url = "https://www.scc.virginia.gov/docketsearchapi/breeze/cases_estabdate/getcasesestdate"
+            params = {
+                "$filter": f"substringof('{docket_clean}',Case_Number) eq true",
+                "$orderby": "EstablishedDate desc",
+                "$select": "MATTER_NO,Case_Number,Case_Name,Case_Caption,Case_Established_Date,STATUS,EstablishedDate"
+            }
+
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                response = await client.get(api_url, params=params)
+
+                if response.status_code != 200:
+                    result.error = f"HTTP {response.status_code}"
+                    return result
+
+                data = response.json()
+
+                if not data or len(data) == 0:
+                    result.found = False
+                    result.error = "Docket not found"
+                    return result
+
+                # Get the first matching case
+                case = data[0]
+                result.found = True
+
+                # Extract fields
+                result.docket_number = case.get("Case_Number", docket_clean)
+                result.utility_name = case.get("Case_Name")
+                result.title = case.get("Case_Caption", "").strip()
+
+                # Parse filing date
+                date_str = case.get("Case_Established_Date")
+                if date_str:
+                    result.filing_date = self._parse_date(date_str)
+
+                # Parse status
+                status = case.get("STATUS", "")
+                if status == "C":
+                    result.status = "closed"
+                elif status == "O":
+                    result.status = "open"
+                elif status == "P":
+                    result.status = "pending"
+                else:
+                    result.status = status.lower() if status else None
+
+                # Extract utility type from title/caption
+                title_lower = (result.title or "").lower()
+                if "electric" in title_lower and "gas" in title_lower:
+                    result.utility_type = "Electric/Gas"
+                elif "electric" in title_lower or "battery" in title_lower or "solar" in title_lower:
+                    result.utility_type = "Electric"
+                elif "gas" in title_lower:
+                    result.utility_type = "Gas"
+                elif "water" in title_lower:
+                    result.utility_type = "Water"
+                elif "telecom" in title_lower or "telephone" in title_lower:
+                    result.utility_type = "Telephone"
+
+                # Extract case type from title
+                if "rate" in title_lower:
+                    result.docket_type = "Rate Case"
+                elif "cpcn" in title_lower or "certificate" in title_lower:
+                    result.docket_type = "Certificate"
+                elif "merger" in title_lower or "acquisition" in title_lower:
+                    result.docket_type = "Merger"
+                elif "complaint" in title_lower:
+                    result.docket_type = "Complaint"
+                elif "fuel" in title_lower:
+                    result.docket_type = "Fuel Factor"
+
+                # Update source URL with internal ID
+                matter_no = case.get("MATTER_NO")
+                if matter_no:
+                    result.source_url = f"https://www.scc.virginia.gov/docketsearch#/caseDetails/{matter_no}"
+
+                return result
+
+        except Exception as e:
+            logger.error(f"VA scrape error: {e}")
+            result.error = f"VA scrape error: {str(e)}"
             return result
 
     async def _scrape_connecticut(self, docket_number: str, result: ScrapedDocket) -> ScrapedDocket:
