@@ -54,31 +54,31 @@ class YouTubeScraper:
         self.timeout = timeout
 
     def _normalize_channel_url(self, url: str) -> str:
-        """Normalize various YouTube channel URL formats to videos tab."""
+        """Normalize various YouTube channel URL formats to videos or streams tab."""
         url = url.rstrip('/')
+
+        # If URL already specifies a tab (videos, streams, playlists), keep it
+        if url.endswith('/videos') or url.endswith('/streams') or url.endswith('/playlists'):
+            return url
 
         # Handle @username format
         if '/@' in url:
-            if not url.endswith('/videos'):
-                url = url + '/videos'
+            url = url + '/videos'
             return url
 
         # Handle /c/channelname format
         if '/c/' in url:
-            if not url.endswith('/videos'):
-                url = url + '/videos'
+            url = url + '/videos'
             return url
 
         # Handle /channel/ID format
         if '/channel/' in url:
-            if not url.endswith('/videos'):
-                url = url + '/videos'
+            url = url + '/videos'
             return url
 
         # Handle /user/username format
         if '/user/' in url:
-            if not url.endswith('/videos'):
-                url = url + '/videos'
+            url = url + '/videos'
             return url
 
         return url
