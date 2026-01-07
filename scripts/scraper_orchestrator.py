@@ -376,7 +376,7 @@ class ScraperOrchestrator:
             scraper = YouTubeScraper(source.url)
 
             logger.info(f"Scraping YouTube: {source.name}")
-            videos = scraper.fetch_videos(max_videos=100)
+            videos = scraper.fetch_videos(max_videos=1500)
             results["items_found"] = len(videos)
 
             # Filter for hearing content
