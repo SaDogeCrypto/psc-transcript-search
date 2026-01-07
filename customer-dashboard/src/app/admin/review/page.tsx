@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react';
 import {
   CheckCircle, XCircle, Link2, SkipForward,
-  Search, RefreshCw, AlertCircle, Filter, Sparkles
+  Search, RefreshCw, AlertCircle, Filter, Sparkles,
+  ExternalLink, Globe, Loader2
 } from 'lucide-react';
 import { PageLayout } from '../components/Layout';
 
@@ -28,6 +29,9 @@ interface ReviewItem {
   current_entity_id: number | null;
   current_entity_name: string | null;
   confidence: string;
+  confidence_score: number | null;
+  match_type: string | null;
+  review_reason: string | null;
   transcript_context: string | null;
   suggestions: ReviewSuggestion[];
 }
@@ -75,6 +79,19 @@ interface ExtractionStats {
   by_state: Record<string, number>;
 }
 
+interface VerificationResult {
+  found: boolean;
+  docket_number: string;
+  state_code: string;
+  title: string | null;
+  company: string | null;
+  filing_date: string | null;
+  status: string | null;
+  utility_type: string | null;
+  url: string | null;
+  error: string | null;
+}
+
 export default function ReviewQueuePage() {
   const [items, setItems] = useState<ReviewItem[]>([]);
   const [stats, setStats] = useState<ReviewStats | null>(null);
@@ -86,6 +103,10 @@ export default function ReviewQueuePage() {
   const [extractionItems, setExtractionItems] = useState<ExtractionReviewItem[]>([]);
   const [extractionStats, setExtractionStats] = useState<ExtractionStats | null>(null);
   const [activeTab, setActiveTab] = useState<'extraction' | 'legacy'>('extraction');
+  const [verifications, setVerifications] = useState<Record<number, VerificationResult>>({});
+  const [verifying, setVerifying] = useState<number | null>(null);
+  const [matching, setMatching] = useState<number | null>(null);
+  const [matchResults, setMatchResults] = useState<Record<number, { success: boolean; message: string }>>({});
 
   // Filters
   const [entityFilter, setEntityFilter] = useState<string>('');
@@ -222,6 +243,66 @@ export default function ReviewQueuePage() {
       setError(err instanceof Error ? err.message : 'Action failed');
     } finally {
       setProcessing(null);
+    }
+  }
+
+  async function verifyExtraction(item: ExtractionReviewItem) {
+    setVerifying(item.id);
+    try {
+      const res = await fetch(`${API_URL}/admin/review/extraction/${item.id}/verify`);
+      if (!res.ok) {
+        throw new Error('Verification failed');
+      }
+      const result: VerificationResult = await res.json();
+      setVerifications(prev => ({ ...prev, [item.id]: result }));
+    } catch (err) {
+      setVerifications(prev => ({
+        ...prev,
+        [item.id]: {
+          found: false,
+          docket_number: item.raw_text,
+          state_code: item.state_code || '',
+          title: null,
+          company: null,
+          filing_date: null,
+          status: null,
+          utility_type: null,
+          url: null,
+          error: err instanceof Error ? err.message : 'Verification failed'
+        }
+      }));
+    } finally {
+      setVerifying(null);
+    }
+  }
+
+  async function matchFromSource(item: ExtractionReviewItem) {
+    setMatching(item.id);
+    try {
+      const res = await fetch(`${API_URL}/admin/review/extraction/${item.id}/match-from-source`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      if (!res.ok) {
+        throw new Error('Match failed');
+      }
+      const result = await res.json();
+      setMatchResults(prev => ({ ...prev, [item.id]: { success: result.success, message: result.message } }));
+
+      if (result.success) {
+        // Remove from list after successful match
+        setExtractionItems(prev => prev.filter(i => i.id !== item.id));
+        // Refresh stats
+        loadExtractionStats();
+      }
+    } catch (err) {
+      setMatchResults(prev => ({
+        ...prev,
+        [item.id]: { success: false, message: err instanceof Error ? err.message : 'Match failed' }
+      }));
+    } finally {
+      setMatching(null);
     }
   }
 
@@ -444,6 +525,21 @@ export default function ReviewQueuePage() {
             </div>
 
             <div style={{ display: 'flex', gap: '0.5rem' }}>
+              {/* Verify button for new docket candidates */}
+              {item.match_type === 'none' && !verifications[item.id] && (
+                <button
+                  className="btn btn-secondary"
+                  style={{ padding: '0.375rem 0.75rem' }}
+                  onClick={() => verifyExtraction(item)}
+                  disabled={verifying === item.id}
+                >
+                  {verifying === item.id ? (
+                    <><Loader2 size={16} className="spin" /> Verifying...</>
+                  ) : (
+                    <><Globe size={16} /> Verify on Source</>
+                  )}
+                </button>
+              )}
               {!item.suggested_correction && item.match_type === 'none' && (
                 <button
                   className="btn btn-primary"
@@ -477,6 +573,91 @@ export default function ReviewQueuePage() {
               {item.context_before && <span>...{item.context_before}</span>}
               <span style={{ fontWeight: 700, color: 'var(--primary)' }}> [{item.raw_text}] </span>
               {item.context_after && <span>{item.context_after}...</span>}
+            </div>
+          )}
+
+          {/* Verification Result */}
+          {verifications[item.id] && (
+            <div style={{
+              background: verifications[item.id].found ? 'var(--success-bg)' : 'var(--danger-bg)',
+              border: `1px solid ${verifications[item.id].found ? 'var(--success)' : 'var(--danger)'}`,
+              padding: '0.75rem',
+              borderRadius: 'var(--radius)',
+              marginBottom: '1rem',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                    {verifications[item.id].found ? (
+                      <CheckCircle size={18} style={{ color: 'var(--success)' }} />
+                    ) : (
+                      <XCircle size={18} style={{ color: 'var(--danger)' }} />
+                    )}
+                    <span style={{ fontWeight: 600 }}>
+                      {verifications[item.id].found ? 'Verified on Source' : 'Not Found on Source'}
+                    </span>
+                  </div>
+                  {verifications[item.id].found && (
+                    <div style={{ fontSize: '0.875rem', color: 'var(--gray-600)' }}>
+                      {verifications[item.id].title && (
+                        <div><strong>Title:</strong> {verifications[item.id].title}</div>
+                      )}
+                      {verifications[item.id].company && (
+                        <div><strong>Company:</strong> {verifications[item.id].company}</div>
+                      )}
+                      {verifications[item.id].utility_type && (
+                        <div><strong>Utility Type:</strong> {verifications[item.id].utility_type}</div>
+                      )}
+                      {verifications[item.id].filing_date && (
+                        <div><strong>Filed:</strong> {verifications[item.id].filing_date}</div>
+                      )}
+                      {verifications[item.id].status && (
+                        <div><strong>Status:</strong> {verifications[item.id].status}</div>
+                      )}
+                    </div>
+                  )}
+                  {verifications[item.id].error && (
+                    <div style={{ fontSize: '0.875rem', color: 'var(--danger)' }}>
+                      Error: {verifications[item.id].error}
+                    </div>
+                  )}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'flex-end' }}>
+                  {verifications[item.id].url && (
+                    <a
+                      href={verifications[item.id].url!}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="btn btn-secondary"
+                      style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
+                    >
+                      <ExternalLink size={14} /> View on PSC
+                    </a>
+                  )}
+                  {verifications[item.id].found && !matchResults[item.id]?.success && (
+                    <button
+                      onClick={() => matchFromSource(item)}
+                      disabled={matching === item.id}
+                      className="btn btn-primary"
+                      style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem' }}
+                    >
+                      {matching === item.id ? (
+                        <><Loader2 size={14} className="spin" /> Matching...</>
+                      ) : (
+                        <><CheckCircle size={14} /> Match &amp; Create Docket</>
+                      )}
+                    </button>
+                  )}
+                  {matchResults[item.id] && (
+                    <span style={{
+                      fontSize: '0.75rem',
+                      color: matchResults[item.id].success ? 'var(--success)' : 'var(--danger)'
+                    }}>
+                      {matchResults[item.id].message}
+                    </span>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 
@@ -609,10 +790,23 @@ export default function ReviewQueuePage() {
                 </span>
                 {confidenceBadge(item.confidence)}
                 <span className="badge badge-gray">{item.entity_type}</span>
+                {item.confidence_score !== null && (
+                  <span className="badge badge-gray">Score: {item.confidence_score}</span>
+                )}
+                {item.match_type && (
+                  <span className={`badge ${item.match_type === 'exact' ? 'badge-success' : item.match_type === 'fuzzy' ? 'badge-warning' : 'badge-gray'}`}>
+                    {item.match_type}
+                  </span>
+                )}
               </div>
               <div style={{ fontSize: '0.875rem', color: 'var(--gray-500)' }}>
                 {item.hearing_title} &bull; {item.hearing_date || 'No date'}
               </div>
+              {item.review_reason && (
+                <div style={{ fontSize: '0.875rem', color: 'var(--warning)', marginTop: '0.25rem' }}>
+                  {item.review_reason}
+                </div>
+              )}
             </div>
 
             <div style={{ display: 'flex', gap: '0.5rem' }}>

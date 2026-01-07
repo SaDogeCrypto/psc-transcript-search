@@ -48,6 +48,9 @@ class ReviewItem(BaseModel):
     current_entity_id: Optional[int] = None
     current_entity_name: Optional[str] = None
     confidence: str
+    confidence_score: Optional[int] = None  # 0-100 smart validation score
+    match_type: Optional[str] = None  # exact, fuzzy, none
+    review_reason: Optional[str] = None
     transcript_context: Optional[str] = None
     suggestions: List[ReviewSuggestion]
 
@@ -174,17 +177,16 @@ def get_utility_suggestions(db: Session, text: str) -> List[dict]:
 @router.get("/stats")
 def get_review_stats(db: Session = Depends(get_db)) -> ReviewQueueStats:
     """Get count of items needing review."""
-    from app.models.database import Docket, HearingTopic, HearingUtility, Topic
+    from app.models.database import Docket, HearingTopic, HearingUtility, HearingDocket, Topic
 
-    # Count unverified dockets
-    docket_count = db.query(Docket).filter(
-        Docket.confidence.in_(["unverified", "possible"]),
-        Docket.review_status == "pending"
+    # Count dockets needing review (via HearingDocket)
+    docket_count = db.query(HearingDocket).filter(
+        HearingDocket.needs_review == True
     ).count()
 
-    # Count uncategorized topics
-    topic_count = db.query(HearingTopic).join(Topic).filter(
-        Topic.category == "uncategorized"
+    # Count topics needing review
+    topic_count = db.query(HearingTopic).filter(
+        HearingTopic.needs_review == True
     ).count()
 
     # Count utilities needing review
@@ -216,7 +218,7 @@ def get_review_queue(
 
     items = []
 
-    # Get unverified dockets
+    # Get dockets needing review
     if entity_type in (None, "docket"):
         docket_query = db.query(
             Docket,
@@ -227,8 +229,7 @@ def get_review_queue(
         ).join(
             Hearing, HearingDocket.hearing_id == Hearing.id
         ).filter(
-            Docket.confidence.in_(["unverified", "possible"]),
-            Docket.review_status == "pending"
+            HearingDocket.needs_review == True
         )
 
         if state:
@@ -237,6 +238,7 @@ def get_review_queue(
             ).filter(State.code == state.upper())
 
         docket_query = docket_query.order_by(
+            HearingDocket.confidence_score.asc().nullsfirst(),
             Hearing.hearing_date.desc()
         ).limit(limit)
 
@@ -263,11 +265,14 @@ def get_review_queue(
                 current_entity_id=docket.known_docket_id,
                 current_entity_name=known_name,
                 confidence=docket.confidence or "unverified",
+                confidence_score=hd.confidence_score,
+                match_type=hd.match_type,
+                review_reason=hd.review_reason,
                 transcript_context=hd.context_summary,
                 suggestions=[ReviewSuggestion(**s) for s in suggestions]
             ))
 
-    # Get uncategorized topics
+    # Get topics needing review
     if entity_type in (None, "topic"):
         topic_query = db.query(
             HearingTopic,
@@ -278,7 +283,7 @@ def get_review_queue(
         ).join(
             Hearing, HearingTopic.hearing_id == Hearing.id
         ).filter(
-            Topic.category == "uncategorized"
+            HearingTopic.needs_review == True
         )
 
         if state:
@@ -287,6 +292,7 @@ def get_review_queue(
             ).filter(State.code == state.upper())
 
         topic_query = topic_query.order_by(
+            HearingTopic.confidence_score.asc().nullsfirst(),
             Hearing.hearing_date.desc()
         ).limit(limit)
 
@@ -303,6 +309,9 @@ def get_review_queue(
                 current_entity_id=topic.id,
                 current_entity_name=topic.category,
                 confidence=ht.confidence or "auto",
+                confidence_score=ht.confidence_score,
+                match_type=ht.match_type,
+                review_reason=ht.review_reason,
                 transcript_context=ht.context_summary,
                 suggestions=[ReviewSuggestion(**s) for s in suggestions]
             ))
@@ -327,6 +336,7 @@ def get_review_queue(
             ).filter(State.code == state.upper())
 
         utility_query = utility_query.order_by(
+            HearingUtility.confidence_score.asc().nullsfirst(),
             Hearing.hearing_date.desc()
         ).limit(limit)
 
@@ -343,6 +353,9 @@ def get_review_queue(
                 current_entity_id=utility.id,
                 current_entity_name=utility.normalized_name,
                 confidence=hu.confidence or "auto",
+                confidence_score=hu.confidence_score,
+                match_type=hu.match_type,
+                review_reason=hu.review_reason,
                 transcript_context=hu.context_summary,
                 suggestions=[ReviewSuggestion(**s) for s in suggestions]
             ))
@@ -968,3 +981,552 @@ def _link_hearing_to_docket(hearing_id: int, docket_id: int, db: Session):
             docket_id=docket_id,
         )
         db.add(link)
+
+
+# =============================================================================
+# EXTRACTION MATCH FROM SOURCE
+# =============================================================================
+
+class MatchFromSourceRequest(BaseModel):
+    """Request to match an extraction to a verified source docket."""
+    notes: Optional[str] = None
+
+
+class MatchFromSourceResponse(BaseModel):
+    """Response after matching extraction to source docket."""
+    success: bool
+    message: str
+    known_docket_id: Optional[int] = None
+    docket_id: Optional[int] = None
+    extraction_status: Optional[str] = None
+    scraped_data: Optional[dict] = None
+
+
+@router.post("/extraction/{extraction_id}/match-from-source")
+async def match_extraction_from_source(
+    extraction_id: int,
+    request: MatchFromSourceRequest = MatchFromSourceRequest(),
+    db: Session = Depends(get_db)
+) -> MatchFromSourceResponse:
+    """
+    Match an extraction to a docket by verifying and scraping from the source PSC website.
+
+    This will:
+    1. Verify the docket exists on the state PSC website
+    2. Create or update the known_docket record with scraped metadata
+    3. Create or update the docket entry
+    4. Link the extraction to the docket
+    5. Mark the extraction as accepted
+    """
+    from app.services.docket_scraper import DocketScraper
+    from app.models.database import KnownDocket, Docket, Hearing, HearingDocket
+    from app.services.docket_parser import parse_docket
+
+    # Get the extraction with hearing info
+    result = db.execute(text("""
+        SELECT ed.id, ed.raw_text, ed.normalized_id, ed.hearing_id,
+               s.code as state_code, h.state_id
+        FROM extracted_dockets ed
+        JOIN hearings h ON ed.hearing_id = h.id
+        JOIN states s ON h.state_id = s.id
+        WHERE ed.id = :id
+    """), {"id": extraction_id})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Extraction not found")
+
+    extraction_id = row[0]
+    docket_number = row[1]
+    normalized_id = row[2]
+    hearing_id = row[3]
+    state_code = row[4]
+    state_id = row[5]
+
+    # Parse the docket ID to extract structured fields
+    parsed = parse_docket(docket_number, state_code)
+
+    # Verify and save using unified scraper
+    scraper = DocketScraper(db)
+    scraped = await scraper.verify_and_save(state_code, docket_number, extraction_id)
+
+    if not scraped.found:
+        return MatchFromSourceResponse(
+            success=False,
+            message=f"Docket not found on source: {scraped.error or 'Not found'}",
+            scraped_data=scraped.to_dict()
+        )
+
+    # Get the known_docket that was created/updated
+    known = db.execute(text(
+        "SELECT id, title, utility_name, utility_type FROM known_dockets WHERE normalized_id = :nid"
+    ), {"nid": normalized_id}).fetchone()
+
+    if not known:
+        return MatchFromSourceResponse(
+            success=False,
+            message="Failed to create known_docket record"
+        )
+
+    known_docket_id = known[0]
+
+    # Update known_docket with parsed fields (parser supplements scraper)
+    # Only update fields that the scraper didn't provide
+    db.execute(text("""
+        UPDATE known_dockets SET
+            year = COALESCE(year, :parsed_year),
+            case_number = COALESCE(case_number, :case_number),
+            raw_prefix = COALESCE(raw_prefix, :prefix),
+            raw_suffix = COALESCE(raw_suffix, :suffix),
+            docket_type = COALESCE(docket_type, :docket_type),
+            company_code = COALESCE(company_code, :company_code),
+            sector = COALESCE(sector, :utility_sector)
+        WHERE id = :id
+    """), {
+        "id": known_docket_id,
+        "parsed_year": parsed.year,
+        "case_number": parsed.case_number,
+        "prefix": parsed.prefix,
+        "suffix": parsed.suffix,
+        "docket_type": parsed.docket_type,
+        "company_code": parsed.company_code,
+        "utility_sector": parsed.utility_sector
+    })
+
+    # Create or update docket entry
+    existing_docket = db.execute(text(
+        "SELECT id FROM dockets WHERE normalized_id = :nid"
+    ), {"nid": normalized_id}).fetchone()
+
+    if existing_docket:
+        docket_id = existing_docket[0]
+        # Update with new info
+        db.execute(text("""
+            UPDATE dockets SET
+                known_docket_id = :known_id,
+                title = COALESCE(:title, title),
+                company = COALESCE(:company, company),
+                confidence = 'verified',
+                review_status = 'reviewed'
+            WHERE id = :id
+        """), {
+            "id": docket_id,
+            "known_id": known_docket_id,
+            "title": scraped.title,
+            "company": scraped.utility_name or scraped.filing_party
+        })
+    else:
+        # Create new docket
+        db.execute(text("""
+            INSERT INTO dockets
+            (state_id, docket_number, normalized_id, known_docket_id, title, company,
+             confidence, review_status, first_seen_at, last_mentioned_at, mention_count)
+            VALUES
+            (:state_id, :docket_number, :normalized_id, :known_id, :title, :company,
+             'verified', 'reviewed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+        """), {
+            "state_id": state_id,
+            "docket_number": docket_number,
+            "normalized_id": normalized_id,
+            "known_id": known_docket_id,
+            "title": scraped.title,
+            "company": scraped.utility_name or scraped.filing_party
+        })
+        db.flush()
+        docket_id = db.execute(text(
+            "SELECT id FROM dockets WHERE normalized_id = :nid"
+        ), {"nid": normalized_id}).fetchone()[0]
+
+    # Create hearing-docket link if not exists
+    existing_link = db.execute(text(
+        "SELECT hearing_id FROM hearing_dockets WHERE hearing_id = :hid AND docket_id = :did"
+    ), {"hid": hearing_id, "did": docket_id}).fetchone()
+
+    if not existing_link:
+        db.execute(text("""
+            INSERT INTO hearing_dockets (hearing_id, docket_id)
+            VALUES (:hid, :did)
+        """), {"hid": hearing_id, "did": docket_id})
+
+    # Update the extraction to accepted, including parsed fields
+    db.execute(text("""
+        UPDATE extracted_dockets SET
+            status = 'accepted',
+            matched_known_docket_id = :known_id,
+            final_docket_id = :docket_id,
+            review_decision = 'matched_from_source',
+            reviewed_by = 'admin',
+            reviewed_at = CURRENT_TIMESTAMP,
+            review_notes = :notes,
+            parsed_year = :parsed_year,
+            parsed_utility_sector = :parsed_sector,
+            parsed_docket_type = :parsed_type,
+            parsed_company_code = :parsed_company
+        WHERE id = :id
+    """), {
+        "id": extraction_id,
+        "known_id": known_docket_id,
+        "docket_id": docket_id,
+        "notes": request.notes or f"Matched from source: {scraped.title}",
+        "parsed_year": parsed.year,
+        "parsed_sector": parsed.utility_sector,
+        "parsed_type": parsed.docket_type,
+        "parsed_company": parsed.company_code
+    })
+
+    db.commit()
+
+    return MatchFromSourceResponse(
+        success=True,
+        message=f"Successfully matched to {normalized_id}",
+        known_docket_id=known_docket_id,
+        docket_id=docket_id,
+        extraction_status="accepted",
+        scraped_data={
+            "title": scraped.title,
+            "utility_type": scraped.utility_type,
+            "company": scraped.utility_name or scraped.filing_party,
+            "filing_date": scraped.filing_date.isoformat() if scraped.filing_date else None,
+            "status": scraped.status,
+            "url": scraped.source_url,
+            "parsed": {
+                "year": parsed.year,
+                "utility_sector": parsed.utility_sector,
+                "docket_type": parsed.docket_type,
+                "company_code": parsed.company_code,
+                "case_number": parsed.case_number
+            }
+        }
+    )
+
+
+# =============================================================================
+# DOCKET VERIFICATION FROM SOURCE
+# =============================================================================
+
+# State PSC lookup URLs
+STATE_LOOKUP_URLS = {
+    "GA": "https://psc.ga.gov/facts-advanced-search/docket/?docketId={docket}",
+    "TX": "https://interchange.puc.texas.gov/search/documents/?controlNumber={docket}&itemNumber=1",
+    "FL": "https://www.floridapsc.com/ClerkOffice/DocketFiling?docket={docket}",
+    "OH": "https://dis.puc.state.oh.us/CaseRecord.aspx?CaseNo={docket}",
+}
+
+
+class DocketVerificationResult(BaseModel):
+    """Result of verifying a docket on the source website."""
+    found: bool
+    docket_number: str
+    state_code: str
+    title: Optional[str] = None
+    company: Optional[str] = None
+    filing_date: Optional[str] = None
+    status: Optional[str] = None
+    utility_type: Optional[str] = None
+    url: Optional[str] = None
+    error: Optional[str] = None
+
+
+@router.get("/extraction/{extraction_id}/verify")
+async def verify_extraction_on_source(
+    extraction_id: int,
+    save: bool = Query(False, description="Save verified docket to known_dockets"),
+    db: Session = Depends(get_db)
+) -> DocketVerificationResult:
+    """
+    Verify an extraction candidate by looking it up on the state's PSC website.
+
+    This helps confirm that new docket candidates actually exist.
+    If save=True, creates or updates the known_dockets record.
+    """
+    from app.services.docket_scraper import DocketScraper
+
+    # Get the extraction
+    result = db.execute(text(
+        "SELECT ed.raw_text, s.code as state_code FROM extracted_dockets ed "
+        "JOIN hearings h ON ed.hearing_id = h.id "
+        "JOIN states s ON h.state_id = s.id "
+        "WHERE ed.id = :id"
+    ), {"id": extraction_id})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Extraction not found")
+
+    docket_number = row[0]
+    state_code = row[1]
+
+    # Use unified scraper
+    scraper = DocketScraper(db)
+
+    if save:
+        scraped = await scraper.verify_and_save(state_code, docket_number, extraction_id)
+    else:
+        scraped = await scraper.scrape_docket(state_code, docket_number)
+
+    return DocketVerificationResult(
+        found=scraped.found,
+        docket_number=scraped.docket_number,
+        state_code=scraped.state_code,
+        title=scraped.title,
+        company=scraped.utility_name or scraped.filing_party,
+        filing_date=scraped.filing_date.isoformat() if scraped.filing_date else None,
+        status=scraped.status,
+        utility_type=scraped.utility_type,
+        url=scraped.source_url,
+        error=scraped.error
+    )
+
+
+@router.get("/docket/{state_code}/{docket_number}/verify")
+async def verify_docket_direct(
+    state_code: str,
+    docket_number: str,
+    save: bool = Query(False, description="Save verified docket to known_dockets"),
+    db: Session = Depends(get_db)
+) -> DocketVerificationResult:
+    """
+    Directly verify a docket by state code and docket number.
+
+    Useful for ad-hoc lookups without an extraction record.
+    """
+    from app.services.docket_scraper import DocketScraper
+
+    scraper = DocketScraper(db)
+
+    if save:
+        scraped = await scraper.verify_and_save(state_code.upper(), docket_number)
+    else:
+        scraped = await scraper.scrape_docket(state_code.upper(), docket_number)
+
+    return DocketVerificationResult(
+        found=scraped.found,
+        docket_number=scraped.docket_number,
+        state_code=scraped.state_code,
+        title=scraped.title,
+        company=scraped.utility_name or scraped.filing_party,
+        filing_date=scraped.filing_date.isoformat() if scraped.filing_date else None,
+        status=scraped.status,
+        utility_type=scraped.utility_type,
+        url=scraped.source_url,
+        error=scraped.error
+    )
+
+
+@router.get("/states/configs")
+async def get_state_configs(
+    db: Session = Depends(get_db)
+) -> List[dict]:
+    """Get all state PSC configurations."""
+    result = db.execute(text(
+        "SELECT state_code, state_name, commission_name, commission_abbreviation, "
+        "website_url, docket_detail_url_template, scraper_type, enabled, "
+        "last_scrape_at, dockets_count "
+        "FROM state_psc_configs ORDER BY state_name"
+    ))
+
+    configs = []
+    for row in result.mappings():
+        configs.append(dict(row))
+
+    return configs
+
+
+def _parse_ga_verification(html: str, docket_number: str, state_code: str, url: str) -> DocketVerificationResult:
+    """Parse Georgia PSC page for docket info."""
+    import re
+
+    # Check if docket exists
+    if f"#{docket_number}" not in html and docket_number not in html:
+        return DocketVerificationResult(
+            found=False,
+            docket_number=docket_number,
+            state_code=state_code,
+            url=url
+        )
+
+    # Extract info from page - Georgia uses <h6> labels followed by values
+    title = None
+    company = None
+    filing_date = None
+    status = None
+    industry = None
+
+    # Title: appears after <h6>Title:</h6> or similar
+    title_match = re.search(r'<h6[^>]*>\s*Title[:\s]*</h6>\s*([^<]+)', html, re.IGNORECASE)
+    if title_match:
+        title = title_match.group(1).strip()
+
+    # Industry (used as company/sector indicator)
+    industry_match = re.search(r'<h6[^>]*>\s*Industry[:\s]*</h6>\s*([^<]+)', html, re.IGNORECASE)
+    if industry_match:
+        industry = industry_match.group(1).strip()
+
+    # Date
+    date_match = re.search(r'<h6[^>]*>\s*Date[:\s]*</h6>\s*([^<]+)', html, re.IGNORECASE)
+    if date_match:
+        filing_date = date_match.group(1).strip()
+
+    # Status
+    status_match = re.search(r'<h6[^>]*>\s*Status[:\s]*</h6>\s*([^<]+)', html, re.IGNORECASE)
+    if status_match:
+        status = status_match.group(1).strip()
+
+    # Look for company name in the content
+    company_patterns = [
+        r'Georgia\s+Power\s+Company',
+        r'Atlanta\s+Gas\s+Light',
+        r'Southern\s+Company\s+Gas',
+        r'Liberty\s+Utilities',
+    ]
+    for pattern in company_patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            company = match.group(0)
+            break
+
+    # If no specific company found but we have industry, use that
+    if not company and industry:
+        company = f"{industry} utility"
+
+    return DocketVerificationResult(
+        found=True,
+        docket_number=docket_number,
+        state_code=state_code,
+        title=title,
+        company=company,
+        filing_date=filing_date,
+        status=status,
+        url=url
+    )
+
+
+async def _parse_tx_verification(html: str, docket_number: str, state_code: str, url: str) -> DocketVerificationResult:
+    """Parse Texas PUC documents page for docket info.
+
+    Uses the /search/documents/ endpoint which has server-rendered HTML with
+    Case Style, File Stamp, and Filing Party fields. Also fetches the PDF
+    to extract utility type.
+    """
+    import re
+    import httpx
+
+    # Check if we got results - look for indicators of no results
+    if "No filings found" in html or "0 results" in html.lower() or "no records" in html.lower():
+        return DocketVerificationResult(
+            found=False,
+            docket_number=docket_number,
+            state_code=state_code,
+            url=url
+        )
+
+    # Check if docket number appears in page
+    if docket_number not in html and f"controlNumber={docket_number}" not in url.lower():
+        return DocketVerificationResult(
+            found=False,
+            docket_number=docket_number,
+            state_code=state_code,
+            url=url
+        )
+
+    # Parse the server-rendered fields
+    # Format: <p><strong>Case Style</strong> &nbsp; Title here</p>
+    title = None
+    company = None
+    filing_date = None
+    utility_type = None
+
+    # Case Style (title)
+    case_style_match = re.search(r'<strong>Case Style</strong>\s*(?:&nbsp;|\s)*([^<]+)', html, re.IGNORECASE)
+    if case_style_match:
+        title = case_style_match.group(1).strip()
+
+    # File Stamp (filing date)
+    file_stamp_match = re.search(r'<strong>File Stamp</strong>\s*(?:&nbsp;|\s)*([^<]+)', html, re.IGNORECASE)
+    if file_stamp_match:
+        filing_date = file_stamp_match.group(1).strip()
+
+    # Filing Party (company)
+    filing_party_match = re.search(r'<strong>Filing Party</strong>\s*(?:&nbsp;|\s)*([^<]+)', html, re.IGNORECASE)
+    if filing_party_match:
+        company = filing_party_match.group(1).strip()
+
+    # Try to extract PDF URL and parse for utility type
+    pdf_match = re.search(r'href="(https://interchange\.puc\.texas\.gov/Documents/[^"]+\.PDF)"', html, re.IGNORECASE)
+    if pdf_match:
+        pdf_url = pdf_match.group(1)
+        try:
+            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+                pdf_response = await client.get(pdf_url)
+                if pdf_response.status_code == 200:
+                    utility_type = _extract_utility_type_from_pdf(pdf_response.content)
+        except Exception:
+            pass  # PDF parsing is best-effort
+
+    return DocketVerificationResult(
+        found=True,
+        docket_number=docket_number,
+        state_code=state_code,
+        title=title,
+        company=company,
+        filing_date=filing_date,
+        status=None,
+        utility_type=utility_type,
+        url=url
+    )
+
+
+def _extract_utility_type_from_pdf(pdf_bytes: bytes) -> Optional[str]:
+    """Extract utility type from Texas PUC Control Number Request Form PDF.
+
+    Uses PyMuPDF to extract text which properly captures checkbox markers.
+    The checked checkbox appears as '~' before the utility type name.
+    Pattern: '~ ELECTRIC ~' means Electric is checked.
+    """
+    try:
+        import fitz  # PyMuPDF
+        from io import BytesIO
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text() + "\n"
+        doc.close()
+
+        # Look for checkbox markers - '~' before the type name indicates checked
+        # Pattern in PDF: "~ ELECTRIC ~" means Electric checkbox is marked
+        lines = text.split('\n')
+        checked_types = []
+
+        for line in lines:
+            line_stripped = line.strip()
+            # Check for pattern: ~ TYPE or ~ TYPE ~
+            if line_stripped.startswith('~'):
+                # Extract the type name after the ~
+                parts = line_stripped.split()
+                if len(parts) >= 2:
+                    type_name = parts[1].upper()
+                    if type_name in ['ELECTRIC', 'TELEPHONE', 'WATER', 'OTHER']:
+                        checked_types.append(type_name.capitalize())
+
+        if checked_types:
+            return ", ".join(checked_types)
+
+        # Fallback to keyword-based detection for older PDFs without checkbox format
+        text_upper = text.upper()
+        electric_indicators = ["ERCOT", "POWER", "ENERGY FUND", "RELIABILITY", "GRID",
+                               "GENERATION", "FUEL", "ANCILLARY", "INTERCONNECTION"]
+        telephone_indicators = ["TELECOM", "COMMUNICATIONS", "CARRIER",
+                                "LONG DISTANCE", "LOCAL EXCHANGE"]
+
+        electric_score = sum(1 for ind in electric_indicators if ind in text_upper)
+        telephone_score = sum(1 for ind in telephone_indicators if ind in text_upper)
+
+        if electric_score > telephone_score:
+            return "Electric"
+        if telephone_score > electric_score:
+            return "Telephone"
+
+        return None
+    except Exception:
+        return None
