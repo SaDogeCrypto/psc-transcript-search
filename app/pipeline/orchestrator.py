@@ -52,15 +52,17 @@ class PipelineStatus(str, Enum):
 
 
 # Hearing status progression through the pipeline
-# Flow: discovered -> downloaded -> transcribed -> analyzed -> smart_extracted -> extracted -> complete
-# Note: Analyze extracts topics/utilities via LLM, SmartExtract finds dockets via regex+fuzzy matching
-#       All entities go to Review for human verification.
+# Flow: discovered -> downloaded -> transcribed -> polished -> analyzed -> smart_extracted -> extracted -> complete
+# Note: LLMPolish fixes transcription errors, Analyze extracts topics/utilities via LLM,
+#       SmartExtract finds dockets via regex+fuzzy matching. All entities go to Review.
 HEARING_STATUSES = {
     "discovered": {"next": "downloading", "stage": "download"},
     "downloading": {"next": "downloaded", "stage": "download", "in_progress": True},
     "downloaded": {"next": "transcribing", "stage": "transcribe"},
     "transcribing": {"next": "transcribed", "stage": "transcribe", "in_progress": True},
-    "transcribed": {"next": "analyzing", "stage": "analyze"},
+    "transcribed": {"next": "polishing", "stage": "llm_polish"},
+    "polishing": {"next": "polished", "stage": "llm_polish", "in_progress": True},
+    "polished": {"next": "analyzing", "stage": "analyze"},
     "analyzing": {"next": "analyzed", "stage": "analyze", "in_progress": True},
     "analyzed": {"next": "smart_extracting", "stage": "smart_extract"},
     "smart_extracting": {"next": "smart_extracted", "stage": "smart_extract", "in_progress": True},
@@ -79,12 +81,13 @@ HEARING_STATUSES = {
 }
 
 # Statuses that can be picked up for processing (non-in-progress, non-terminal)
-PROCESSABLE_STATUSES = ["discovered", "downloaded", "transcribed", "analyzed", "smart_extracted", "linked", "matched", "extracted", "error"]
+PROCESSABLE_STATUSES = ["discovered", "downloaded", "transcribed", "polished", "analyzed", "smart_extracted", "linked", "matched", "extracted", "error"]
 
 # Map from stage name to (in_progress_status, complete_status)
 STAGE_TO_STATUS = {
     "download": ("downloading", "downloaded"),
     "transcribe": ("transcribing", "transcribed"),
+    "llm_polish": ("polishing", "polished"),
     "analyze": ("analyzing", "analyzed"),
     "smart_extract": ("smart_extracting", "smart_extracted"),
     "extract": ("extracting", "extracted"),
@@ -159,6 +162,7 @@ class PipelineOrchestrator:
         if self._stages is None:
             from app.pipeline.stages.download import DownloadStage
             from app.pipeline.stages.transcribe import TranscribeStage
+            from app.pipeline.stages.llm_polish import LLMPolishStage
             from app.pipeline.stages.analyze import AnalyzeStage
             from app.pipeline.stages.smart_extract import SmartExtractStage
             from app.pipeline.stages.extract import ExtractStage
@@ -166,6 +170,7 @@ class PipelineOrchestrator:
             self._stages = {
                 "download": DownloadStage(),
                 "transcribe": TranscribeStage(),
+                "llm_polish": LLMPolishStage(),  # Fix transcription errors
                 "analyze": AnalyzeStage(),  # LLM analysis + topics/utilities extraction
                 "smart_extract": SmartExtractStage(),  # Regex docket extraction
                 "extract": ExtractStage(),  # Embeddings for search
@@ -402,7 +407,8 @@ class PipelineOrchestrator:
             stage_input_statuses = {
                 "download": ["discovered"],
                 "transcribe": ["downloaded"],
-                "analyze": ["transcribed"],
+                "llm_polish": ["transcribed"],
+                "analyze": ["polished"],
                 "smart_extract": ["analyzed", "linked", "matched"],  # Legacy statuses for backward compat
                 "extract": ["smart_extracted"],
             }
@@ -604,7 +610,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Exit after processing available work")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
     parser.add_argument("--states", help="Comma-separated state codes (e.g., FL,GA,TX)")
-    parser.add_argument("--only", choices=["download", "transcribe", "analyze", "smart_extract", "extract"],
+    parser.add_argument("--only", choices=["download", "transcribe", "llm_polish", "analyze", "smart_extract", "extract"],
                        help="Only run specific stage")
     parser.add_argument("--max-cost", type=float, help="Max cost for this run")
     parser.add_argument("--max-hearings", type=int, help="Max hearings to process")
