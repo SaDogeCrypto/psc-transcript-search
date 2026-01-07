@@ -1056,7 +1056,14 @@ class DocketScraper:
                 return result
 
             await search_input.fill(docket_number)
-            await page.keyboard.press("Enter")
+
+            # Angular apps need button click, not Enter key
+            search_btn = await page.query_selector('button.quick-search-btn, #quickSearchBtn, button[type="submit"]')
+            if search_btn:
+                await search_btn.click()
+            else:
+                # Fallback to Enter if no button found
+                await page.keyboard.press("Enter")
             await asyncio.sleep(5)
 
             # Update source URL to actual page
@@ -1065,8 +1072,8 @@ class DocketScraper:
             # Get page content
             text = await page.inner_text("body")
 
-            # Check if docket was found
-            if "No results found" in text or docket_number not in text:
+            # Check if docket was found - AZ shows "0 record(s) found" or stays on homepage
+            if "0 record(s) found" in text or "item-detail" not in page.url:
                 result.found = False
                 result.error = "Docket not found"
                 return result
