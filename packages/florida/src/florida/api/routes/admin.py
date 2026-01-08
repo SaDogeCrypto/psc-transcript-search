@@ -48,14 +48,11 @@ class AdminStatsResponse(BaseModel):
     total_cost: float
     hearings_last_24h: int
     hearings_last_7d: int
-    sources_healthy: int
-    sources_error: int
-    pipeline_jobs_pending: int
-    pipeline_jobs_running: int
-    pipeline_jobs_error: int
-    cost_today: float
-    cost_this_week: float
-    cost_this_month: float
+
+
+class RunStageRequest(BaseModel):
+    stage: str
+    hearing_ids: List[int]
 
 
 class SourceResponse(BaseModel):
@@ -702,46 +699,83 @@ def list_pipeline_runs(
 
 @router.post("/pipeline/run-stage")
 def run_pipeline_stage(
-    stage: str = Query(..., description="Stage to run: analyze"),
-    hearing_ids: Optional[str] = Query(None, description="Comma-separated hearing IDs"),
-    limit: int = Query(10, description="Max hearings to process"),
+    request: RunStageRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
-    Trigger a specific pipeline stage.
+    Trigger a specific pipeline stage on selected hearings.
 
-    For 'analyze' stage, this will queue hearings for analysis.
-    Actual processing happens via the batch_analyze.py script.
+    Supported stages:
+    - transcribe: Queue hearings for transcription
+    - analyze: Queue hearings for analysis
     """
-    if stage != "analyze":
-        return {
-            "message": f"Stage '{stage}' not supported in this API. Use batch scripts.",
-            "supported_stages": ["analyze"]
-        }
+    stage = request.stage
+    hearing_ids = request.hearing_ids
 
-    # Find hearings ready for analysis
-    if hearing_ids:
-        ids = [int(x.strip()) for x in hearing_ids.split(",")]
-        query = db.query(FLHearing).filter(FLHearing.id.in_(ids))
-    else:
-        # Find hearings with transcripts but no analysis
-        query = db.execute(text("""
-            SELECT h.id, h.title FROM fl_hearings h
-            JOIN fl_transcript_segments s ON s.hearing_id = h.id
-            LEFT JOIN fl_analyses a ON a.hearing_id = h.id
-            WHERE a.id IS NULL
-            GROUP BY h.id, h.title
-            HAVING COUNT(s.id) > 10
-            LIMIT :limit
-        """), {"limit": limit})
+    if stage not in ["transcribe", "analyze"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Stage '{stage}' not supported. Supported stages: transcribe, analyze"
+        )
 
-    hearings_to_process = list(query)
+    if not hearing_ids:
+        raise HTTPException(status_code=400, detail="No hearing IDs provided")
+
+    # Get the hearings
+    hearings = db.query(FLHearing).filter(FLHearing.id.in_(hearing_ids)).all()
+
+    if not hearings:
+        raise HTTPException(status_code=404, detail="No hearings found with provided IDs")
+
+    processed = []
+    errors = []
+
+    for hearing in hearings:
+        try:
+            if stage == "transcribe":
+                # Mark hearing as ready for transcription
+                # The actual transcription happens via batch_transcribe.py
+                if hearing.status == "pending":
+                    processed.append({"id": hearing.id, "title": hearing.title[:50]})
+                else:
+                    errors.append({"id": hearing.id, "error": f"Cannot transcribe: status is {hearing.status}"})
+
+            elif stage == "analyze":
+                # Check if hearing has transcript segments
+                segment_count = db.query(func.count(FLTranscriptSegment.id)).filter(
+                    FLTranscriptSegment.hearing_id == hearing.id
+                ).scalar()
+
+                if segment_count > 0:
+                    # Check if already analyzed
+                    existing_analysis = db.query(FLAnalysis).filter(
+                        FLAnalysis.hearing_id == hearing.id
+                    ).first()
+
+                    if existing_analysis:
+                        errors.append({"id": hearing.id, "error": "Already analyzed"})
+                    else:
+                        # Mark as ready for analysis (status transcribed -> will be picked up by batch_analyze)
+                        if hearing.status != "analyzed":
+                            hearing.status = "transcribed"
+                            processed.append({"id": hearing.id, "title": hearing.title[:50]})
+                        else:
+                            errors.append({"id": hearing.id, "error": "Already analyzed"})
+                else:
+                    errors.append({"id": hearing.id, "error": "No transcript segments found"})
+
+        except Exception as e:
+            errors.append({"id": hearing.id, "error": str(e)})
+
+    db.commit()
 
     return {
-        "message": f"Found {len(hearings_to_process)} hearings ready for analysis",
+        "message": f"Queued {len(processed)} hearings for {stage}",
         "stage": stage,
-        "hearings": [{"id": h[0], "title": h[1][:50]} for h in hearings_to_process],
-        "note": "Run 'python scripts/batch_analyze.py' to process these hearings"
+        "processed": processed,
+        "errors": errors,
+        "note": f"Run 'python scripts/batch_{stage}.py' to process these hearings"
     }
 
 
@@ -871,18 +905,90 @@ def get_hearing_details(hearing_id: int, db: Session = Depends(get_db)):
 
     analysis = db.query(FLAnalysis).filter(FLAnalysis.hearing_id == hearing_id).first()
 
+    # Build synthetic jobs list based on processing state
+    jobs = []
+    job_id = 1
+
+    # Transcription job
+    if segment_count > 0:
+        jobs.append({
+            "id": job_id,
+            "stage": "transcribe",
+            "status": "completed",
+            "started_at": hearing.processed_at.isoformat() if hearing.processed_at else hearing.created_at.isoformat() if hearing.created_at else None,
+            "completed_at": hearing.processed_at.isoformat() if hearing.processed_at else None,
+            "cost_usd": float(hearing.processing_cost_usd) if hearing.processing_cost_usd else None,
+            "details": f"{segment_count} segments transcribed"
+        })
+        job_id += 1
+
+    # Analysis job
+    if analysis:
+        jobs.append({
+            "id": job_id,
+            "stage": "analyze",
+            "status": "completed",
+            "started_at": analysis.created_at.isoformat() if analysis.created_at else None,
+            "completed_at": analysis.created_at.isoformat() if analysis.created_at else None,
+            "cost_usd": float(analysis.cost_usd) if analysis.cost_usd else None,
+            "details": analysis.one_sentence_summary[:100] if analysis.one_sentence_summary else "Analysis complete"
+        })
+
+    # Get transcript preview (first 10 segments)
+    segments = db.query(FLTranscriptSegment).filter(
+        FLTranscriptSegment.hearing_id == hearing_id
+    ).order_by(FLTranscriptSegment.start_time).limit(20).all()
+
+    transcript_preview = []
+    for seg in segments:
+        transcript_preview.append({
+            "speaker": seg.speaker_name or seg.speaker_label or "Unknown",
+            "text": seg.text,
+            "start_time": seg.start_time,
+            "end_time": seg.end_time
+        })
+
+    # Build analysis data
+    analysis_data = None
+    if analysis:
+        analysis_data = {
+            "summary": analysis.summary,
+            "one_sentence_summary": analysis.one_sentence_summary,
+            "hearing_type": analysis.hearing_type,
+            "utility_name": analysis.utility_name,
+            "sector": analysis.sector,
+            "participants": analysis.participants_json or [],
+            "issues": analysis.issues_json or [],
+            "commitments": analysis.commitments_json or [],
+            "quotes": analysis.quotes_json or [],
+            "topics": analysis.topics_extracted or [],
+            "utilities": analysis.utilities_extracted or [],
+            "commissioner_concerns": analysis.commissioner_concerns_json or [],
+            "commissioner_mood": analysis.commissioner_mood,
+            "public_comments": analysis.public_comments,
+            "public_sentiment": analysis.public_sentiment,
+            "likely_outcome": analysis.likely_outcome,
+            "outcome_confidence": analysis.outcome_confidence,
+            "risk_factors": analysis.risk_factors_json or [],
+            "action_items": analysis.action_items_json or [],
+        }
+
     return {
         "id": hearing.id,
         "title": hearing.title,
         "hearing_date": hearing.hearing_date.isoformat() if hearing.hearing_date else None,
         "hearing_type": hearing.hearing_type,
         "source_url": hearing.source_url,
+        "video_url": hearing.source_url,  # For Florida, source_url is the video
         "transcript_status": hearing.transcript_status,
         "segment_count": segment_count,
         "has_analysis": analysis is not None,
         "analysis_summary": analysis.one_sentence_summary if analysis else None,
-        "processing_cost": float(hearing.processing_cost_usd) if hearing.processing_cost_usd else None,
-        "analysis_cost": float(analysis.cost_usd) if analysis and analysis.cost_usd else None
+        "processing_cost_usd": float(hearing.processing_cost_usd) if hearing.processing_cost_usd else None,
+        "analysis_cost": float(analysis.cost_usd) if analysis and analysis.cost_usd else None,
+        "jobs": jobs,
+        "transcript_preview": transcript_preview,
+        "analysis": analysis_data
     }
 
 
