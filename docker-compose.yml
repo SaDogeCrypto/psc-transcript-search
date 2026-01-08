@@ -1,25 +1,7 @@
 version: "3.8"
 
 services:
-  # PostgreSQL with pgvector extension
-  db:
-    image: pgvector/pgvector:pg16
-    container_name: psc-db
-    environment:
-      POSTGRES_USER: psc
-      POSTGRES_PASSWORD: psc_dev
-      POSTGRES_DB: psc_dev
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U psc -d psc_dev"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # FastAPI backend
+  # FastAPI backend (connects to Azure PostgreSQL)
   api:
     build:
       context: .
@@ -28,21 +10,23 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://psc:psc_dev@db:5432/psc_dev
+      # Azure PostgreSQL (Florida)
+      DATABASE_URL: ${DATABASE_URL}
+      FL_DATABASE_URL: ${FL_DATABASE_URL}
       STORAGE_TYPE: local
       AUDIO_DIR: /data/audio
-      LOG_LEVEL: DEBUG
-      # API keys - set in .env file
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # API keys from .env
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-admin-dev-key}
     volumes:
       - ./src:/app/src:ro
+      - ./packages:/app/packages:ro
       - ./data:/data
-    depends_on:
-      db:
-        condition: service_healthy
-    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn florida.api.app:app --host 0.0.0.0 --port 8000 --reload
 
   # Next.js dashboard (optional - uncomment to use)
   # dashboard:
@@ -59,6 +43,3 @@ services:
   #   depends_on:
   #     - api
   #   command: npm run dev
-
-volumes:
-  postgres_data:
