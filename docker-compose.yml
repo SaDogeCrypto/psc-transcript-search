@@ -1,50 +1,64 @@
-version: '3.8'
+version: "3.8"
 
 services:
+  # PostgreSQL with pgvector extension
   db:
     image: pgvector/pgvector:pg16
+    container_name: psc-db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: canaryscope
+      POSTGRES_USER: psc
+      POSTGRES_PASSWORD: psc_dev
+      POSTGRES_DB: psc_dev
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
-      - ./migrations/002_dockets_tracking.sql:/docker-entrypoint-initdb.d/002_dockets_tracking.sql
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U psc -d psc_dev"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  backend:
+  # FastAPI backend
+  api:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: psc-api
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/canaryscope
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      DATABASE_URL: postgresql://psc:psc_dev@db:5432/psc_dev
+      STORAGE_TYPE: local
+      AUDIO_DIR: /data/audio
+      LOG_LEVEL: DEBUG
+      # API keys - set in .env file
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-admin-dev-key}
+    volumes:
+      - ./src:/app/src:ro
+      - ./data:/data
     depends_on:
       db:
         condition: service_healthy
-    volumes:
-      - ./data:/app/data
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 
-  frontend:
-    build:
-      context: ./customer-dashboard
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
-    environment:
-      NEXT_PUBLIC_API_URL: http://backend:8000
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/canaryscope
-    depends_on:
-      - backend
+  # Next.js dashboard (optional - uncomment to use)
+  # dashboard:
+  #   build:
+  #     context: ./customer-dashboard
+  #     dockerfile: Dockerfile
+  #   container_name: psc-dashboard
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     NEXT_PUBLIC_API_URL: http://localhost:8000
+  #   volumes:
+  #     - ./customer-dashboard/src:/app/src:ro
+  #   depends_on:
+  #     - api
+  #   command: npm run dev
 
 volumes:
-  pgdata:
+  postgres_data:

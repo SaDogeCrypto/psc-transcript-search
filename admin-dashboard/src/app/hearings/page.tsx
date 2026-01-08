@@ -3,84 +3,53 @@
 import { useEffect, useState } from 'react';
 import {
   AlertCircle,
-  CheckCircle,
+  Calendar,
   Clock,
-  Download,
   ExternalLink,
   FileAudio,
-  Mic,
+  Play,
   RefreshCw,
-  RotateCcw,
   Search,
   Sparkles,
-  XCircle,
 } from 'lucide-react';
 import { PageLayout } from '@/components/Layout';
-import { getHearings, retryHearing, cancelHearing, Hearing, PipelineJob } from '@/lib/api';
-
-const PIPELINE_STAGES = ['download', 'transcribe', 'analyze'];
-
-function PipelineStage({ stage, job }: { stage: string; job?: PipelineJob }) {
-  const stageIcons: Record<string, React.ComponentType<{ size?: number; color?: string }>> = {
-    download: Download,
-    transcribe: Mic,
-    analyze: Sparkles,
-  };
-
-  const Icon = stageIcons[stage] || Clock;
-
-  const getStatusClass = () => {
-    if (!job) return 'pending';
-    return job.status;
-  };
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-      <div className={`stage-icon ${getStatusClass()}`}>
-        {job?.status === 'running' ? (
-          <RefreshCw size={14} className="animate-spin" />
-        ) : (
-          <Icon size={14} />
-        )}
-      </div>
-      <span style={{ marginTop: '0.25rem', fontSize: '0.7rem', color: 'var(--gray-500)', textTransform: 'capitalize' }}>{stage}</span>
-    </div>
-  );
-}
+import { getHearings, runPipelineSingle, type Hearing, type PaginatedResponse } from '@/lib/api';
 
 function HearingCard({
   hearing,
-  onRetry,
-  onCancel,
+  onProcess,
 }: {
   hearing: Hearing;
-  onRetry: (id: number) => void;
-  onCancel: (id: number) => void;
+  onProcess: (id: string, stage: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-
-  const jobsByStage = hearing.pipeline_jobs.reduce((acc, job) => {
-    acc[job.stage] = job;
-    return acc;
-  }, {} as Record<string, PipelineJob>);
-
-  const hasError = hearing.pipeline_jobs.some((j) => j.status === 'error');
-  const isRunning = hearing.pipeline_jobs.some((j) => j.status === 'running');
+  const [processing, setProcessing] = useState(false);
 
   const getStatusBadge = () => {
-    switch (hearing.pipeline_status) {
-      case 'complete':
+    switch (hearing.transcript_status) {
+      case 'analyzed':
         return 'badge-success';
-      case 'error':
+      case 'failed':
         return 'badge-danger';
-      case 'downloading':
+      case 'transcribed':
       case 'transcribing':
-      case 'analyzing':
         return 'badge-info';
       default:
         return 'badge-gray';
     }
   };
+
+  const handleProcess = async (stage: string) => {
+    setProcessing(true);
+    try {
+      await onProcess(hearing.id, stage);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const canTranscribe = ['pending', 'discovered'].includes(hearing.transcript_status || '') && hearing.video_url;
+  const canAnalyze = hearing.transcript_status === 'transcribed';
 
   return (
     <div className="card" style={{ cursor: 'pointer' }} onClick={() => setExpanded(!expanded)}>
@@ -88,7 +57,7 @@ function HearingCard({
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
             <h4 style={{ fontWeight: 600, fontSize: '0.95rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {hearing.title}
+              {hearing.title || 'Untitled Hearing'}
             </h4>
             <span className="badge badge-primary" style={{ fontSize: '0.7rem' }}>{hearing.state_code}</span>
           </div>
@@ -100,82 +69,69 @@ function HearingCard({
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          {/* Pipeline stages */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
-            {PIPELINE_STAGES.map((stage, idx) => (
-              <div key={stage} style={{ display: 'flex', alignItems: 'center' }}>
-                <PipelineStage stage={stage} job={jobsByStage[stage]} />
-                {idx < PIPELINE_STAGES.length - 1 && (
-                  <div style={{ width: '16px', height: '2px', background: 'var(--gray-200)', margin: '0 0.25rem' }} />
-                )}
-              </div>
-            ))}
-          </div>
-          <span className={`badge ${getStatusBadge()}`}>{hearing.pipeline_status}</span>
+          <span className={`badge ${getStatusBadge()}`}>{hearing.transcript_status || 'pending'}</span>
         </div>
       </div>
 
       {expanded && (
         <div style={{ marginTop: '1rem', paddingTop: '1rem', borderTop: '1px solid var(--gray-200)' }} onClick={(e) => e.stopPropagation()}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem', fontSize: '0.85rem' }}>
-            <div>
-              <div style={{ color: 'var(--gray-500)' }}>Created</div>
-              <div style={{ fontWeight: 500 }}>{new Date(hearing.created_at).toLocaleString()}</div>
-            </div>
-            {hearing.source_url && (
+            {hearing.docket_number && (
               <div>
-                <div style={{ color: 'var(--gray-500)' }}>Source</div>
-                <a href={hearing.source_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}>
+                <div style={{ color: 'var(--gray-500)' }}>Docket</div>
+                <div style={{ fontWeight: 500 }}>{hearing.docket_number}</div>
+              </div>
+            )}
+            {hearing.hearing_type && (
+              <div>
+                <div style={{ color: 'var(--gray-500)' }}>Type</div>
+                <div style={{ fontWeight: 500 }}>{hearing.hearing_type}</div>
+              </div>
+            )}
+            {hearing.sector && (
+              <div>
+                <div style={{ color: 'var(--gray-500)' }}>Sector</div>
+                <div style={{ fontWeight: 500 }}>{hearing.sector}</div>
+              </div>
+            )}
+            {hearing.video_url && (
+              <div>
+                <div style={{ color: 'var(--gray-500)' }}>Video</div>
+                <a href={hearing.video_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}>
                   View <ExternalLink size={12} />
                 </a>
               </div>
             )}
           </div>
 
-          {hearing.pipeline_jobs.length > 0 && (
-            <div style={{ marginBottom: '1rem' }}>
-              <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--gray-600)', marginBottom: '0.5rem' }}>Pipeline Jobs</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                {hearing.pipeline_jobs.map((job) => (
-                  <div
-                    key={job.id}
-                    style={{
-                      padding: '0.75rem',
-                      background: job.status === 'error' ? '#fee2e2' : 'var(--gray-50)',
-                      borderRadius: 'var(--radius)',
-                      fontSize: '0.85rem',
-                    }}
-                  >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        <span style={{ fontWeight: 500, textTransform: 'capitalize' }}>{job.stage}</span>
-                        <span className={`badge ${job.status === 'complete' ? 'badge-success' : job.status === 'error' ? 'badge-danger' : job.status === 'running' ? 'badge-info' : 'badge-gray'}`} style={{ fontSize: '0.7rem' }}>
-                          {job.status}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: '0.75rem', color: 'var(--gray-500)' }}>
-                        {job.retry_count > 0 && <span style={{ marginRight: '0.5rem' }}>Retries: {job.retry_count}</span>}
-                        {job.cost_usd && <span>${job.cost_usd.toFixed(4)}</span>}
-                      </div>
-                    </div>
-                    {job.error_message && (
-                      <div style={{ marginTop: '0.5rem', color: '#991b1b', fontSize: '0.8rem' }}>{job.error_message}</div>
-                    )}
-                  </div>
-                ))}
-              </div>
+          {hearing.one_sentence_summary && (
+            <div style={{ marginBottom: '1rem', padding: '0.75rem', background: 'var(--gray-50)', borderRadius: 'var(--radius)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--gray-500)', marginBottom: '0.25rem' }}>Summary</div>
+              <p style={{ fontSize: '0.85rem', color: 'var(--gray-700)' }}>{hearing.one_sentence_summary}</p>
             </div>
           )}
 
           <div style={{ display: 'flex', gap: '0.5rem' }}>
-            {hasError && (
-              <button onClick={() => onRetry(hearing.id)} className="btn btn-primary" style={{ fontSize: '0.8rem' }}>
-                <RotateCcw size={14} /> Retry Failed
+            {canTranscribe && (
+              <button
+                onClick={() => handleProcess('transcribe')}
+                disabled={processing}
+                className="btn btn-primary"
+                style={{ fontSize: '0.8rem' }}
+              >
+                {processing ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}
+                Transcribe
               </button>
             )}
-            {isRunning && (
-              <button onClick={() => onCancel(hearing.id)} className="btn btn-danger" style={{ fontSize: '0.8rem' }}>
-                <XCircle size={14} /> Cancel
+            {canAnalyze && (
+              <button
+                onClick={() => handleProcess('analyze')}
+                disabled={processing}
+                className="btn btn-secondary"
+                style={{ fontSize: '0.8rem' }}
+              >
+                {processing ? <RefreshCw size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                Analyze
               </button>
             )}
           </div>
@@ -187,24 +143,31 @@ function HearingCard({
 
 export default function HearingsPage() {
   const [hearings, setHearings] = useState<Hearing[]>([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [page, setPage] = useState(0);
+  const pageSize = 20;
 
   useEffect(() => {
     loadHearings();
-  }, [filter]);
+  }, [filter, page]);
 
   async function loadHearings() {
     try {
       setLoading(true);
-      const params: { pipeline_status?: string } = {};
+      const params: { status?: string; limit: number; offset: number } = {
+        limit: pageSize,
+        offset: page * pageSize,
+      };
       if (filter !== 'all') {
-        params.pipeline_status = filter;
+        params.status = filter;
       }
       const data = await getHearings(params);
-      setHearings(data);
+      setHearings(data.items);
+      setTotal(data.total);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load hearings');
     } finally {
@@ -212,32 +175,21 @@ export default function HearingsPage() {
     }
   }
 
-  async function handleRetry(hearingId: number) {
+  async function handleProcess(hearingId: string, stage: string) {
     try {
-      await retryHearing(hearingId);
+      await runPipelineSingle(hearingId, stage);
       await loadHearings();
     } catch (err) {
-      console.error('Failed to retry hearing:', err);
-    }
-  }
-
-  async function handleCancel(hearingId: number) {
-    try {
-      await cancelHearing(hearingId);
-      await loadHearings();
-    } catch (err) {
-      console.error('Failed to cancel hearing:', err);
+      console.error('Failed to process hearing:', err);
     }
   }
 
   const filteredHearings = hearings.filter((h) =>
-    h.title.toLowerCase().includes(searchQuery.toLowerCase())
+    (h.title || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (h.docket_number || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const statusCounts = hearings.reduce((acc, h) => {
-    acc[h.pipeline_status] = (acc[h.pipeline_status] || 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
+  const totalPages = Math.ceil(total / pageSize);
 
   if (loading && hearings.length === 0) {
     return (
@@ -267,8 +219,8 @@ export default function HearingsPage() {
     <PageLayout activeTab="hearings">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
         <div>
-          <h2 style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--gray-800)' }}>Hearings Pipeline</h2>
-          <p style={{ color: 'var(--gray-500)', marginTop: '0.25rem' }}>Monitor and manage hearing processing</p>
+          <h2 style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--gray-800)' }}>Hearings</h2>
+          <p style={{ color: 'var(--gray-500)', marginTop: '0.25rem' }}>Manage hearing processing ({total} total)</p>
         </div>
         <button onClick={loadHearings} className="btn btn-secondary">
           <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
@@ -296,10 +248,10 @@ export default function HearingsPage() {
 
       {/* Filter tabs */}
       <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem', overflowX: 'auto', borderBottom: '1px solid var(--gray-200)', paddingBottom: '0.5rem' }}>
-        {['all', 'discovered', 'downloading', 'transcribing', 'analyzing', 'complete', 'error'].map((status) => (
+        {['all', 'pending', 'transcribed', 'analyzed', 'failed'].map((status) => (
           <button
             key={status}
-            onClick={() => setFilter(status)}
+            onClick={() => { setFilter(status); setPage(0); }}
             style={{
               background: 'none',
               border: 'none',
@@ -311,10 +263,10 @@ export default function HearingsPage() {
               borderBottom: filter === status ? '2px solid var(--primary)' : '2px solid transparent',
               marginBottom: '-0.55rem',
               whiteSpace: 'nowrap',
+              textTransform: 'capitalize',
             }}
           >
-            {status.charAt(0).toUpperCase() + status.slice(1)}
-            {status === 'all' ? ` (${hearings.length})` : ` (${statusCounts[status] || 0})`}
+            {status}
           </button>
         ))}
       </div>
@@ -328,16 +280,42 @@ export default function HearingsPage() {
           </p>
         </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-          {filteredHearings.map((hearing) => (
-            <HearingCard
-              key={hearing.id}
-              hearing={hearing}
-              onRetry={handleRetry}
-              onCancel={handleCancel}
-            />
-          ))}
-        </div>
+        <>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+            {filteredHearings.map((hearing) => (
+              <HearingCard
+                key={hearing.id}
+                hearing={hearing}
+                onProcess={handleProcess}
+              />
+            ))}
+          </div>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '1rem', marginTop: '1.5rem' }}>
+              <button
+                onClick={() => setPage(Math.max(0, page - 1))}
+                disabled={page === 0}
+                className="btn btn-secondary"
+                style={{ fontSize: '0.85rem' }}
+              >
+                Previous
+              </button>
+              <span style={{ fontSize: '0.85rem', color: 'var(--gray-500)' }}>
+                Page {page + 1} of {totalPages}
+              </span>
+              <button
+                onClick={() => setPage(Math.min(totalPages - 1, page + 1))}
+                disabled={page >= totalPages - 1}
+                className="btn btn-secondary"
+                style={{ fontSize: '0.85rem' }}
+              >
+                Next
+              </button>
+            </div>
+          )}
+        </>
       )}
     </PageLayout>
   );

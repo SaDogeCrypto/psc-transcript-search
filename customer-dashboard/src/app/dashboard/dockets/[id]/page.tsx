@@ -5,26 +5,17 @@ import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 import {
   ArrowLeft,
-  Eye,
-  EyeOff,
   Share2,
   Building2,
   Calendar,
-  MapPin,
   Clock,
   Play,
   FileText,
-  Loader2,
 } from 'lucide-react'
-import {
-  getDocketByNormalizedId,
-  addToWatchlist,
-  removeFromWatchlist,
-  getWatchlist,
-  type DocketWithTimeline,
-} from '@/lib/api'
+import { getDocket } from '@/lib/api'
+import { formatDate } from '@/lib/utils'
 
-function getStatusBadge(status?: string) {
+function getStatusBadge(status?: string | null) {
   switch (status?.toLowerCase()) {
     case 'open':
     case 'under_review':
@@ -41,7 +32,7 @@ function getStatusBadge(status?: string) {
   }
 }
 
-function formatDocketType(type?: string): string {
+function formatDocketType(type?: string | null): string {
   if (!type) return 'Unknown'
   return type
     .split('_')
@@ -49,26 +40,33 @@ function formatDocketType(type?: string): string {
     .join(' ')
 }
 
+interface DocketDetail {
+  id: string
+  docket_number: string
+  state_code: string
+  title: string | null
+  status: string | null
+  docket_type: string | null
+  filed_date: string | null
+  closed_date: string | null
+  documents: any[]
+  hearings: any[]
+}
+
 export default function DocketDetailPage() {
   const params = useParams()
   const router = useRouter()
-  const normalizedId = params.id as string
+  const docketId = params.id as string
 
-  const [docket, setDocket] = useState<DocketWithTimeline | null>(null)
+  const [docket, setDocket] = useState<DocketDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [isWatched, setIsWatched] = useState(false)
-  const [watchLoading, setWatchLoading] = useState(false)
 
   useEffect(() => {
     async function loadDocket() {
       try {
-        const [docketData, watchlistData] = await Promise.all([
-          getDocketByNormalizedId(normalizedId),
-          getWatchlist(),
-        ])
+        const docketData = await getDocket(docketId)
         setDocket(docketData)
-        setIsWatched(watchlistData.dockets.some((d) => d.normalized_id === normalizedId.toUpperCase()))
       } catch (err) {
         console.error('Error loading docket:', err)
         setError('Docket not found')
@@ -77,29 +75,10 @@ export default function DocketDetailPage() {
       }
     }
     loadDocket()
-  }, [normalizedId])
-
-  const handleToggleWatch = async () => {
-    if (!docket) return
-    setWatchLoading(true)
-    try {
-      if (isWatched) {
-        await removeFromWatchlist(docket.id)
-        setIsWatched(false)
-      } else {
-        await addToWatchlist(docket.id)
-        setIsWatched(true)
-      }
-    } catch (err) {
-      console.error('Error toggling watch:', err)
-    } finally {
-      setWatchLoading(false)
-    }
-  }
+  }, [docketId])
 
   const handleShare = () => {
     navigator.clipboard.writeText(window.location.href)
-    // Could add a toast notification here
   }
 
   if (loading) {
@@ -118,12 +97,12 @@ export default function DocketDetailPage() {
       <div className="text-center py-12">
         <FileText className="w-12 h-12 text-gray-300 mx-auto mb-4" />
         <h2 className="text-lg font-medium text-gray-900 mb-2">Docket not found</h2>
-        <p className="text-gray-500 mb-4">The docket "{normalizedId}" could not be found.</p>
+        <p className="text-gray-500 mb-4">The docket could not be found.</p>
         <button
           onClick={() => router.back()}
           className="text-blue-600 hover:text-blue-700 font-medium"
         >
-          ← Go back
+          Go back
         </button>
       </div>
     )
@@ -142,33 +121,13 @@ export default function DocketDetailPage() {
           <ArrowLeft className="w-4 h-4" />
           Back
         </button>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleToggleWatch}
-            disabled={watchLoading}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
-              isWatched
-                ? 'bg-blue-100 text-blue-700 hover:bg-blue-200'
-                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-            }`}
-          >
-            {watchLoading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : isWatched ? (
-              <Eye className="w-4 h-4" />
-            ) : (
-              <EyeOff className="w-4 h-4" />
-            )}
-            {isWatched ? 'Watching' : 'Watch'}
-          </button>
-          <button
-            onClick={handleShare}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
-          >
-            <Share2 className="w-4 h-4" />
-            Share
-          </button>
-        </div>
+        <button
+          onClick={handleShare}
+          className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+        >
+          <Share2 className="w-4 h-4" />
+          Share
+        </button>
       </div>
 
       {/* Docket Header */}
@@ -176,10 +135,10 @@ export default function DocketDetailPage() {
         <div className="flex items-start justify-between mb-4">
           <div>
             <h1 className="text-2xl font-bold text-gray-900 font-mono mb-2">
-              {docket.normalized_id}
+              {docket.docket_number}
             </h1>
-            {docket.company && (
-              <h2 className="text-lg text-gray-700">{docket.company}</h2>
+            {docket.title && (
+              <h2 className="text-lg text-gray-700">{docket.title}</h2>
             )}
           </div>
           <span className={`px-3 py-1 rounded-full text-sm font-medium ${statusBadge.color}`}>
@@ -189,24 +148,13 @@ export default function DocketDetailPage() {
 
         {/* Metadata Grid */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-gray-100">
-          {docket.company && (
-            <div>
-              <div className="text-xs text-gray-500 mb-1">Company</div>
-              <div className="flex items-center gap-1.5 text-sm text-gray-900">
-                <Building2 className="w-4 h-4 text-gray-400" />
-                {docket.company}
-              </div>
+          <div>
+            <div className="text-xs text-gray-500 mb-1">State</div>
+            <div className="flex items-center gap-1.5 text-sm text-gray-900">
+              <Building2 className="w-4 h-4 text-gray-400" />
+              {docket.state_code}
             </div>
-          )}
-          {docket.state_name && (
-            <div>
-              <div className="text-xs text-gray-500 mb-1">State</div>
-              <div className="flex items-center gap-1.5 text-sm text-gray-900">
-                <MapPin className="w-4 h-4 text-gray-400" />
-                {docket.state_name}
-              </div>
-            </div>
-          )}
+          </div>
           {docket.docket_type && (
             <div>
               <div className="text-xs text-gray-500 mb-1">Type</div>
@@ -215,95 +163,99 @@ export default function DocketDetailPage() {
               </div>
             </div>
           )}
-          {docket.first_seen_at && (
+          {docket.filed_date && (
             <div>
-              <div className="text-xs text-gray-500 mb-1">First Seen</div>
+              <div className="text-xs text-gray-500 mb-1">Filed Date</div>
               <div className="flex items-center gap-1.5 text-sm text-gray-900">
                 <Calendar className="w-4 h-4 text-gray-400" />
-                {new Date(docket.first_seen_at).toLocaleDateString('en-US', {
-                  month: 'short',
-                  day: 'numeric',
-                  year: 'numeric',
-                })}
+                {formatDate(docket.filed_date)}
+              </div>
+            </div>
+          )}
+          {docket.closed_date && (
+            <div>
+              <div className="text-xs text-gray-500 mb-1">Closed Date</div>
+              <div className="flex items-center gap-1.5 text-sm text-gray-900">
+                <Calendar className="w-4 h-4 text-gray-400" />
+                {formatDate(docket.closed_date)}
               </div>
             </div>
           )}
         </div>
       </div>
 
-      {/* Summary */}
-      {docket.current_summary && (
-        <div className="bg-white rounded-xl border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-3">Summary</h3>
-          <p className="text-gray-700 leading-relaxed">{docket.current_summary}</p>
-        </div>
-      )}
-
-      {/* Description */}
-      {docket.description && !docket.current_summary && (
-        <div className="bg-white rounded-xl border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-3">Description</h3>
-          <p className="text-gray-700 leading-relaxed">{docket.description}</p>
-        </div>
-      )}
-
-      {/* Timeline */}
+      {/* Related Hearings */}
       <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <h3 className="text-lg font-semibold text-gray-900 mb-4">Timeline</h3>
+        <h3 className="text-lg font-semibold text-gray-900 mb-4">Related Hearings</h3>
 
-        {docket.timeline.length === 0 ? (
+        {!docket.hearings || docket.hearings.length === 0 ? (
           <div className="text-center py-8 text-gray-500">
             <Clock className="w-8 h-8 mx-auto mb-2 text-gray-300" />
-            <p>No hearing mentions yet</p>
+            <p>No hearings associated with this docket</p>
           </div>
         ) : (
-          <div className="relative">
-            {/* Timeline line */}
-            <div className="absolute left-4 top-0 bottom-0 w-0.5 bg-gray-200" />
-
-            <div className="space-y-6">
-              {docket.timeline.map((item, index) => (
-                <div key={item.hearing_id} className="relative pl-10">
-                  {/* Timeline dot */}
-                  <div className="absolute left-2.5 top-1.5 w-3 h-3 rounded-full bg-blue-500 border-2 border-white" />
-
-                  <div className="bg-gray-50 rounded-lg p-4">
-                    {/* Date */}
-                    {item.hearing_date && (
-                      <div className="text-sm font-medium text-gray-900 mb-2">
-                        {new Date(item.hearing_date).toLocaleDateString('en-US', {
-                          month: 'long',
-                          day: 'numeric',
-                          year: 'numeric',
-                        })}
-                      </div>
-                    )}
-
-                    {/* Summary */}
-                    {item.mention_summary && (
-                      <p className="text-sm text-gray-700 mb-3">{item.mention_summary}</p>
-                    )}
-
-                    {/* Hearing link */}
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-gray-500 truncate max-w-[60%]">
-                        {item.hearing_title}
-                      </span>
-                      <Link
-                        href={`/dashboard/hearings/${item.hearing_id}`}
-                        className="flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-700 font-medium"
-                      >
-                        <Play className="w-3.5 h-3.5" />
-                        Watch clip
-                      </Link>
+          <div className="space-y-4">
+            {docket.hearings.map((hearing: any) => (
+              <div key={hearing.id} className="bg-gray-50 rounded-lg p-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-gray-900 mb-1">
+                      {hearing.title || 'Untitled Hearing'}
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-gray-500">
+                      {hearing.hearing_date && (
+                        <span className="flex items-center gap-1">
+                          <Calendar className="w-3.5 h-3.5" />
+                          {formatDate(hearing.hearing_date)}
+                        </span>
+                      )}
+                      {hearing.hearing_type && (
+                        <span className="px-2 py-0.5 bg-gray-200 rounded">
+                          {hearing.hearing_type}
+                        </span>
+                      )}
                     </div>
                   </div>
+                  <Link
+                    href={`/dashboard/hearings/${hearing.id}`}
+                    className="flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-700 font-medium ml-4"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    View
+                  </Link>
                 </div>
-              ))}
-            </div>
+              </div>
+            ))}
           </div>
         )}
       </div>
+
+      {/* Related Documents */}
+      {docket.documents && docket.documents.length > 0 && (
+        <div className="bg-white rounded-xl border border-gray-200 p-6">
+          <h3 className="text-lg font-semibold text-gray-900 mb-4">Documents</h3>
+          <div className="space-y-2">
+            {docket.documents.map((doc: any) => (
+              <div key={doc.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                <div className="flex items-center gap-3">
+                  <FileText className="w-4 h-4 text-gray-400" />
+                  <span className="text-sm text-gray-700">{doc.title || doc.filename || 'Document'}</span>
+                </div>
+                {doc.url && (
+                  <a
+                    href={doc.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-blue-600 hover:text-blue-700"
+                  >
+                    View
+                  </a>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

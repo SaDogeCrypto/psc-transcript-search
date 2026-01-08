@@ -46,3 +46,14 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Test results
+test-results/
+**/test-results/
+
+# TypeScript build info
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# Egg info
+*.egg-info/

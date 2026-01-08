@@ -3281,7 +3281,7 @@ export default function PipelinePage() {
                     </h4>
                     <div style={{ fontSize: '0.85rem', color: 'var(--gray-500)' }}>
                       {detailHearing.hearing_date && <span>Date: {detailHearing.hearing_date} • </span>}
-                      <span>Cost: ${detailHearing.processing_cost_usd.toFixed(4)}</span>
+                      {detailHearing.processing_cost_usd != null && <span>Cost: ${detailHearing.processing_cost_usd.toFixed(4)}</span>}
                     </div>
                     {detailHearing.video_url && (
                       <a
@@ -3300,7 +3300,7 @@ export default function PipelinePage() {
                     <h5 style={{ margin: '0 0 0.75rem 0', fontSize: '0.9rem', fontWeight: 600, color: 'var(--gray-700)' }}>
                       Processing History
                     </h5>
-                    {detailHearing.jobs.length === 0 ? (
+                    {!detailHearing.jobs || detailHearing.jobs.length === 0 ? (
                       <div style={{ fontSize: '0.875rem', color: 'var(--gray-500)' }}>No processing history yet</div>
                     ) : (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>

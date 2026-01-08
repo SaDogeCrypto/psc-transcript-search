@@ -18,6 +18,7 @@ from florida.models.base import Base, JSONB, ARRAY
 if TYPE_CHECKING:
     from florida.models.document import FLDocument
     from florida.models.hearing import FLHearing
+    from florida.models.linking import FLHearingDocket
 
 
 class FLDocket(Base):
@@ -72,6 +73,13 @@ class FLDocket(Base):
     # Relationships
     documents: Mapped[List["FLDocument"]] = relationship("FLDocument", back_populates="docket")
     hearings: Mapped[List["FLHearing"]] = relationship("FLHearing", back_populates="docket")
+
+    # Entity linking relationships (many-to-many via junction table)
+    hearing_links: Mapped[List["FLHearingDocket"]] = relationship(
+        "FLHearingDocket",
+        back_populates="docket",
+        cascade="all, delete-orphan"
+    )
 
     def __repr__(self):
         return f"<FLDocket {self.docket_number}: {self.title[:50] if self.title else 'No title'}>"

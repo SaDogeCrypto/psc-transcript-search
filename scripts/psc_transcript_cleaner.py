@@ -22,7 +22,9 @@ from typing import Dict, List, Tuple
 
 # Simple word/phrase replacements (case-insensitive matching, preserves case pattern)
 WORD_REPLACEMENTS = {
-    # Company names
+    # =========================================================================
+    # GEORGIA (GA) - Companies
+    # =========================================================================
     "george power": "Georgia Power",
     "georgia power company": "Georgia Power Company",
     "walt me mc": "Walton EMC",
@@ -37,6 +39,108 @@ WORD_REPLACEMENTS = {
     "southern company": "Southern Company",
     "next era": "NextEra",
     "nextera": "NextEra",
+    "ogle thorpe": "Oglethorpe Power",
+    "oglethorpe": "Oglethorpe Power",
+
+    # =========================================================================
+    # TEXAS (TX) - Companies and Terms
+    # =========================================================================
+    "er cot": "ERCOT",
+    "air cot": "ERCOT",
+    "erkot": "ERCOT",
+    "puct": "PUCT",
+    "p u c t": "PUCT",
+    "on core": "Oncor",
+    "encore": "Oncor",
+    "center point": "CenterPoint",
+    "centerpoint energy": "CenterPoint Energy",
+    "aep texas": "AEP Texas",
+    "a e p texas": "AEP Texas",
+    "entergy texas": "Entergy Texas",
+    "enter g texas": "Entergy Texas",
+    "texas new mexico power": "Texas-New Mexico Power",
+    "tex new mexico": "Texas-New Mexico Power",
+    "luminant": "Luminant",
+    "lumen ant": "Luminant",
+    "vistra": "Vistra",
+    "vista energy": "Vistra Energy",
+
+    # =========================================================================
+    # CALIFORNIA (CA) - Companies and Terms
+    # =========================================================================
+    "cpuc": "CPUC",
+    "c p u c": "CPUC",
+    "see puck": "CPUC",
+    "pg and e": "PG&E",
+    "pg&e": "PG&E",
+    "p g and e": "PG&E",
+    "pacific gas": "Pacific Gas and Electric",
+    "pacific gas electric": "Pacific Gas and Electric",
+    "so cal edison": "Southern California Edison",
+    "socal edison": "Southern California Edison",
+    "southern california edison": "Southern California Edison",
+    "s c e": "SCE",
+    "sce": "SCE",
+    "san diego gas": "San Diego Gas & Electric",
+    "sdg and e": "SDG&E",
+    "sdg&e": "SDG&E",
+    "cal water": "Cal Water",
+    "california water": "California Water",
+    "sempra": "Sempra",
+    "sem pra": "Sempra",
+
+    # =========================================================================
+    # FLORIDA (FL) - Companies and Terms
+    # =========================================================================
+    "fpsc": "FPSC",
+    "f p s c": "FPSC",
+    "florida power light": "Florida Power & Light",
+    "florida power and light": "Florida Power & Light",
+    "fpl": "FPL",
+    "f p l": "FPL",
+    "duke energy florida": "Duke Energy Florida",
+    "duke florida": "Duke Energy Florida",
+    "tampa electric": "Tampa Electric",
+    "teco": "TECO",
+    "t e c o": "TECO",
+    "gulf power": "Gulf Power",
+
+    # =========================================================================
+    # OHIO (OH) - Companies and Terms
+    # =========================================================================
+    "puco": "PUCO",
+    "p u c o": "PUCO",
+    "aep ohio": "AEP Ohio",
+    "a e p ohio": "AEP Ohio",
+    "duke energy ohio": "Duke Energy Ohio",
+    "duke ohio": "Duke Energy Ohio",
+    "first energy": "FirstEnergy",
+    "firstenergy": "FirstEnergy",
+    "ohio edison": "Ohio Edison",
+    "toledo edison": "Toledo Edison",
+    "dayton power": "Dayton Power & Light",
+    "dayton power light": "Dayton Power & Light",
+    "dp and l": "DP&L",
+    "dp&l": "DP&L",
+
+    # =========================================================================
+    # ARIZONA (AZ) - Companies and Terms
+    # =========================================================================
+    "acc": "ACC",
+    "a c c": "ACC",
+    "arizona corporation commission": "Arizona Corporation Commission",
+    "arizona public service": "Arizona Public Service",
+    "aps": "APS",
+    "a p s": "APS",
+    "tucson electric": "Tucson Electric Power",
+    "tucson electric power": "Tucson Electric Power",
+    "tep": "TEP",
+    "t e p": "TEP",
+    "salt river project": "Salt River Project",
+    "srp": "SRP",
+    "s r p": "SRP",
+    "uni source": "UniSource Energy",
+    "unisource": "UniSource Energy",
 
     # Government/Legal entities
     "george springboard": "Georgia Supreme Court",
@@ -125,17 +229,49 @@ WORD_REPLACEMENTS = {
 
 # Regex patterns for more complex replacements
 REGEX_REPLACEMENTS = [
-    # Docket numbers - various formats
+    # =========================================================================
+    # DOCKET NUMBER PATTERNS (state-specific)
+    # =========================================================================
+
+    # Generic docket patterns
     (r"docu(?:ment)?\s*(?:number|no\.?)?\s*(\d+)\s*(?:thought|dot|/)?\s*(\d+)", r"Docket No. \1-\2"),
     (r"docket\s*(?:number|no\.?)?\s*#?\s*(\d+)", r"Docket No. \1"),
     (r"docket\s*#?\s*(\d+)\s*(?:and|&)\s*#?\s*(\d+)", r"Docket Nos. \1 and \2"),
     (r"docu\s+number\s+five\s+thought\s+973", "Docket No. 55973"),
 
-    # OCGA citations
+    # Texas - Project numbers (5-digit)
+    (r"project\s*(?:number|no\.?)?\s*#?\s*(\d{4,5})\b", r"Project No. \1"),
+    (r"proj\s*(?:number|no\.?)?\s*#?\s*(\d{4,5})\b", r"Project No. \1"),
+
+    # California - Application/Rulemaking numbers (A.YY-MM-NNN, R.YY-MM-NNN)
+    (r"application\s*(?:number|no\.?)?\s*([aAr])[\.\s]*(\d{2})[\s\-]*(\d{2})[\s\-]*(\d{3})", r"\1.\2-\3-\4"),
+    (r"rulemaking\s*(?:number|no\.?)?\s*[rR][\.\s]*(\d{2})[\s\-]*(\d{2})[\s\-]*(\d{3})", r"R.\1-\2-\3"),
+
+    # Florida - YYYYNNNN-XX format
+    (r"docket\s*(?:number|no\.?)?\s*(20\d{2})[\s\-]*(\d{4})[\s\-]*([A-Z]{2})", r"Docket \1\2-\3"),
+
+    # Ohio - YY-NNNN-XX-XXX format
+    (r"case\s*(?:number|no\.?)?\s*(\d{2})[\s\-]*(\d{4})[\s\-]*([A-Z]{2})[\s\-]*([A-Z]{2,3})", r"Case \1-\2-\3-\4"),
+
+    # Arizona - L-NNNNN[A]-YY-NNNN format
+    (r"docket\s*(?:number|no\.?)?\s*([A-Z])[\s\-]*(\d{5})[A-Z]?[\s\-]*(\d{2})[\s\-]*(\d{4})", r"Docket \1-\2-\3-\4"),
+
+    # =========================================================================
+    # LEGAL CITATIONS
+    # =========================================================================
+
+    # OCGA citations (Georgia)
     (r"o\s*c\s*g\s*a\s*(?:section)?\s*(\d+)[- ](\d+)[- ](\d+)\s*(?:sub\s*)?(?:part\s*)?([a-z])?", r"OCGA §\1-\2-\3(\4)"),
     (r"section\s*(\d+)[- ](\d+)[- ](\d+)\s*(?:sub\s*)?(?:part\s*)?([a-z])?", r"§\1-\2-\3(\4)"),
     # Clean up empty parens from above
     (r"\(\)", ""),
+
+    # Texas Administrative Code
+    (r"tack\s*(\d+)[\.\s]*(\d+)", r"TAC §\1.\2"),
+    (r"t\s*a\s*c\s*(?:section)?\s*(\d+)[\.\s]*(\d+)", r"TAC §\1.\2"),
+
+    # California Public Utilities Code
+    (r"p\s*u\s*(?:code|c)\s*(?:section)?\s*(\d+)", r"PU Code §\1"),
 
     # KW/MW with numbers
     (r"(\d+)\s*(?:kilo\s*watts?|killer?\s*(?:one|once|watts?))", r"\1 kW"),

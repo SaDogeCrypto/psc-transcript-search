@@ -11,7 +11,7 @@ Provides REST API for Florida regulatory intelligence:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from florida.api.routes import dockets, documents, hearings, search, dashboard, admin
+from florida.api.routes import dockets, documents, hearings, search, dashboard, admin, review
 from florida.config import get_config
 
 
@@ -48,6 +48,9 @@ def create_app() -> FastAPI:
 
     # Admin routes for pipeline management
     app.include_router(admin.router)
+
+    # Review routes for entity linking
+    app.include_router(review.router)
 
     @app.get("/api/fl/health")
     async def health_check():

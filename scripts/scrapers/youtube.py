@@ -389,10 +389,11 @@ EXCLUDE_KEYWORDS = [
     # 911/Emergency services (not utility regulation)
     "911 enterprise board", "911 task force",
     "esinet", "ipcs task force", "gis informational",
-    "9-1-1 leadership",
+    "9-1-1 leadership", "when to call 911",
 
     # Podcasts
     "behind the meter: an mpsc podcast",
+    "sustainability leaders podcast",
 
     # Promotional ads and PSAs
     "#winterreadydc", "#here2helpdc",
@@ -418,13 +419,17 @@ EXCLUDE_KEYWORDS = [
     # Tutorials and how-tos
     "how to make your voice heard",
     "how to read and understand your",
-    "tutorial: how to",
+    "tutorial: how to", "tutorial: cómo",
     "using interactive maps", "use puco docketing",
     "navigating a cpuc docket",
     "how to subscribe to case",
     "making an electronic filing",
     "prequalification and basic navigation",
     "application map and application process",
+    "how to navigate", "how to become",
+    "how to file", "how to prepare",
+    "how to comment", "how to apply",
+    "how to do advanced",
 
     # History/overview promos
     "history behind the public utilities",
@@ -436,6 +441,7 @@ EXCLUDE_KEYWORDS = [
     "pride flag raising",
     "swearing in ceremony",
     "careers in utilities",
+    "community award", "leadership award",
 
     # Conferences (not hearings)
     "cybersecurity conference",
@@ -443,10 +449,20 @@ EXCLUDE_KEYWORDS = [
     "clean energy summit",
     "supplier diversity hearing",
 
+    # Educational summits (not regulatory hearings)
+    "natural gas summit", "nuclear summit",
+    "propane summit", "solar summit", "water summit",
+    "wildfire technology innovation summit",
+
     # Press/staff conferences
     "press conference", "press briefing",
     "staff conference",
     "lihwap press conference",
+    "press release", "press event",
+
+    # Town halls (community outreach, not regulatory)
+    "consumer town hall", "town hall meeting",
+    "radio town hall",
 
     # Bill education
     "understand your electric bill",
@@ -503,6 +519,25 @@ EXCLUDE_KEYWORDS = [
 
     # Broadband (different regulatory domain)
     "bead challenge", "bead rebuttal", "bead program",
+    "bead workshop", "permissible challenger",
+
+    # Seminars and training
+    "seminar", "training:",
+
+    # Lifeline promotional
+    "lifeline awareness", "talks about california lifeline",
+
+    # MEDSIS/Power Connect promos
+    "medsis explainer", "medsis town hall",
+    "power connect site",
+
+    # News segments
+    "— wjla", "— wusa",
+
+    # Anniversary/promotional videos
+    "anniversary movie", "anniversary video",
+    "shopping for electricity",
+    "act 13 disbursements",
 
     # Generic non-hearing content
     "opening remarks", "closing remarks",

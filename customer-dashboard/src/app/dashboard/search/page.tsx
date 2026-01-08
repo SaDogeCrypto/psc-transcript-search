@@ -7,15 +7,14 @@ import {
   Search,
   Filter,
   Calendar,
-  Clock,
-  Play,
   FileText,
-  User,
   X,
   ExternalLink,
 } from 'lucide-react'
 import { search, getStates, type SearchResult, type State } from '@/lib/api'
-import { formatDate, formatTimestamp } from '@/lib/utils'
+import { formatDate } from '@/lib/utils'
+
+const PAGE_SIZE = 20
 
 export default function SearchPage() {
   const router = useRouter()
@@ -29,7 +28,8 @@ export default function SearchPage() {
 
   // Search params
   const query = searchParams.get('q') || ''
-  const selectedStates = searchParams.get('states')?.split(',').filter(Boolean) || []
+  const selectedState = searchParams.get('state_code') || ''
+  const docketNumber = searchParams.get('docket_number') || ''
   const dateFrom = searchParams.get('date_from') || ''
   const dateTo = searchParams.get('date_to') || ''
   const page = parseInt(searchParams.get('page') || '1')
@@ -67,16 +67,18 @@ export default function SearchPage() {
     async function doSearch() {
       setLoading(true)
       try {
+        const offset = (page - 1) * PAGE_SIZE
         const data = await search({
-          q: query,
-          states: selectedStates.join(',') || undefined,
+          query,
+          state_code: selectedState || undefined,
+          docket_number: docketNumber || undefined,
           date_from: dateFrom || undefined,
           date_to: dateTo || undefined,
-          page,
-          page_size: 20,
+          limit: PAGE_SIZE,
+          offset,
         })
         setResults(data.results)
-        setTotalCount(data.total_count)
+        setTotalCount(data.total)
       } catch (error) {
         console.error('Search error:', error)
       } finally {
@@ -85,7 +87,7 @@ export default function SearchPage() {
     }
 
     doSearch()
-  }, [query, selectedStates.join(','), dateFrom, dateTo, page])
+  }, [query, selectedState, docketNumber, dateFrom, dateTo, page])
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
@@ -94,18 +96,16 @@ export default function SearchPage() {
     }
   }
 
-  const toggleState = (code: string) => {
-    const newStates = selectedStates.includes(code)
-      ? selectedStates.filter((s) => s !== code)
-      : [...selectedStates, code]
-    updateParams({ states: newStates.join(',') || null })
+  const selectState = (code: string) => {
+    updateParams({ state_code: code || null })
   }
 
   const clearFilters = () => {
     router.push(`/dashboard/search?q=${encodeURIComponent(query)}`)
   }
 
-  const hasActiveFilters = selectedStates.length > 0 || dateFrom || dateTo
+  const hasActiveFilters = selectedState || docketNumber || dateFrom || dateTo
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE)
 
   return (
     <div className="space-y-6">
@@ -159,7 +159,7 @@ export default function SearchPage() {
             )}
           </div>
 
-          <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
             {/* States */}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -169,9 +169,9 @@ export default function SearchPage() {
                 {states.map((state) => (
                   <button
                     key={state.code}
-                    onClick={() => toggleState(state.code)}
+                    onClick={() => selectState(selectedState === state.code ? '' : state.code)}
                     className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                      selectedStates.includes(state.code)
+                      selectedState === state.code
                         ? 'bg-blue-600 text-white'
                         : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
                     }`}
@@ -180,6 +180,20 @@ export default function SearchPage() {
                   </button>
                 ))}
               </div>
+            </div>
+
+            {/* Docket Number */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Docket Number
+              </label>
+              <input
+                type="text"
+                value={docketNumber}
+                placeholder="e.g. 2024-0001-EI"
+                onChange={(e) => updateParams({ docket_number: e.target.value || null })}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+              />
             </div>
 
             {/* Date Range */}
@@ -213,21 +227,34 @@ export default function SearchPage() {
       {/* Active filters badges */}
       {hasActiveFilters && !showFilters && (
         <div className="flex flex-wrap gap-2">
-          {selectedStates.map((state) => (
-            <span
-              key={state}
-              className="inline-flex items-center gap-1 px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm"
-            >
-              {state}
-              <button onClick={() => toggleState(state)}>
+          {selectedState && (
+            <span className="inline-flex items-center gap-1 px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm">
+              {selectedState}
+              <button onClick={() => selectState('')}>
                 <X className="h-3.5 w-3.5" />
               </button>
             </span>
-          ))}
+          )}
+          {docketNumber && (
+            <span className="inline-flex items-center gap-1 px-3 py-1 bg-gray-100 text-gray-700 rounded-full text-sm">
+              Docket: {docketNumber}
+              <button onClick={() => updateParams({ docket_number: null })}>
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </span>
+          )}
           {dateFrom && (
             <span className="inline-flex items-center gap-1 px-3 py-1 bg-gray-100 text-gray-700 rounded-full text-sm">
               From: {dateFrom}
               <button onClick={() => updateParams({ date_from: null })}>
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </span>
+          )}
+          {dateTo && (
+            <span className="inline-flex items-center gap-1 px-3 py-1 bg-gray-100 text-gray-700 rounded-full text-sm">
+              To: {dateTo}
+              <button onClick={() => updateParams({ date_to: null })}>
                 <X className="h-3.5 w-3.5" />
               </button>
             </span>
@@ -271,12 +298,12 @@ export default function SearchPage() {
           </p>
 
           {/* Result cards */}
-          {results.map((result) => (
-            <SearchResultCard key={result.segment_id} result={result} query={query} />
+          {results.map((result, index) => (
+            <SearchResultCard key={`${result.hearing_id}-${index}`} result={result} query={query} />
           ))}
 
           {/* Pagination */}
-          {results.length >= 20 && (
+          {totalPages > 1 && (
             <div className="flex justify-center gap-4">
               <button
                 onClick={() => updateParams({ page: String(page - 1) })}
@@ -285,10 +312,13 @@ export default function SearchPage() {
               >
                 Previous
               </button>
-              <span className="px-4 py-2 text-gray-500">Page {page}</span>
+              <span className="px-4 py-2 text-gray-500">
+                Page {page} of {totalPages}
+              </span>
               <button
                 onClick={() => updateParams({ page: String(page + 1) })}
-                className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+                disabled={page >= totalPages}
+                className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 disabled:opacity-50"
               >
                 Next
               </button>
@@ -321,7 +351,7 @@ function SearchResultCard({ result, query }: { result: SearchResult; query: stri
 
   return (
     <Link
-      href={`/dashboard/hearings/${result.hearing_id}?t=${Math.floor(result.start_time)}`}
+      href={`/dashboard/hearings/${result.hearing_id}`}
       className="block bg-white rounded-xl border border-gray-200 p-4 hover:border-blue-200 hover:shadow-md transition-all"
     >
       <div className="flex items-start gap-4">
@@ -332,7 +362,7 @@ function SearchResultCard({ result, query }: { result: SearchResult; query: stri
         <div className="flex-1 min-w-0">
           {/* Hearing title */}
           <h3 className="font-medium text-gray-900 line-clamp-1">
-            {result.hearing_title}
+            {result.hearing_title || 'Untitled Hearing'}
           </h3>
 
           {/* Meta info */}
@@ -341,14 +371,14 @@ function SearchResultCard({ result, query }: { result: SearchResult; query: stri
               <Calendar className="h-3.5 w-3.5" />
               {formatDate(result.hearing_date)}
             </span>
-            <span className="flex items-center gap-1">
-              <Clock className="h-3.5 w-3.5" />
-              {formatTimestamp(result.start_time)}
-            </span>
-            {result.speaker && (
-              <span className="flex items-center gap-1">
-                <User className="h-3.5 w-3.5" />
-                {result.speaker}
+            {result.docket_number && (
+              <span className="px-2 py-0.5 bg-gray-100 rounded text-xs">
+                {result.docket_number}
+              </span>
+            )}
+            {result.hearing_type && (
+              <span className="px-2 py-0.5 bg-gray-100 rounded text-xs">
+                {result.hearing_type}
               </span>
             )}
           </div>
@@ -363,7 +393,7 @@ function SearchResultCard({ result, query }: { result: SearchResult; query: stri
 
         <div className="flex-shrink-0">
           <div className="h-10 w-10 rounded-full bg-blue-100 flex items-center justify-center">
-            <Play className="h-4 w-4 text-blue-600" />
+            <ExternalLink className="h-4 w-4 text-blue-600" />
           </div>
         </div>
       </div>

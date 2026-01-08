@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from florida.models.docket import FLDocket
     from florida.models.entity import FLEntity
     from florida.models.analysis import FLAnalysis
+    from florida.models.linking import FLHearingDocket, FLHearingUtility, FLHearingTopic
 
 
 class FLHearing(Base):
@@ -82,6 +83,23 @@ class FLHearing(Base):
         "FLAnalysis",
         back_populates="hearing",
         uselist=False,
+        cascade="all, delete-orphan"
+    )
+
+    # Entity linking relationships (many-to-many)
+    docket_links: Mapped[List["FLHearingDocket"]] = relationship(
+        "FLHearingDocket",
+        back_populates="hearing",
+        cascade="all, delete-orphan"
+    )
+    utility_links: Mapped[List["FLHearingUtility"]] = relationship(
+        "FLHearingUtility",
+        back_populates="hearing",
+        cascade="all, delete-orphan"
+    )
+    topic_links: Mapped[List["FLHearingTopic"]] = relationship(
+        "FLHearingTopic",
+        back_populates="hearing",
         cascade="all, delete-orphan"
     )
 

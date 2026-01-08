@@ -1,7 +1,7 @@
 'use client'
 
 import { useRef, useEffect, useState } from 'react'
-import { User, Clock, ChevronDown, ChevronUp } from 'lucide-react'
+import { User, Clock, ChevronDown } from 'lucide-react'
 import { formatTimestamp } from '@/lib/utils'
 import type { Segment } from '@/lib/api'
 
@@ -24,12 +24,13 @@ export function TranscriptViewer({
 }: TranscriptViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
-  const [activeSegmentId, setActiveSegmentId] = useState<number | null>(null)
+  const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null)
 
   // Find and highlight the current segment based on video time
   useEffect(() => {
     const currentSegment = segments.find(
-      (s) => currentTime >= s.start_time && currentTime < s.end_time
+      (s) => s.start_time !== null && s.end_time !== null &&
+             currentTime >= s.start_time && currentTime < s.end_time
     )
 
     if (currentSegment && currentSegment.id !== activeSegmentId) {
@@ -144,7 +145,7 @@ export function TranscriptViewer({
               >
                 <div className="flex items-center gap-2 mb-1 text-xs text-gray-400">
                   <Clock className="h-3 w-3" />
-                  <span>{formatTimestamp(segment.start_time)}</span>
+                  <span>{segment.timestamp_display || (segment.start_time !== null ? formatTimestamp(segment.start_time) : '-')}</span>
                 </div>
                 <p className={`text-sm leading-relaxed ${
                   activeSegmentId === segment.id ? 'text-gray-900' : 'text-gray-700'
@@ -186,9 +187,10 @@ function groupBySpeaker(segments: Segment[]): Array<{
   let currentGroup: typeof groups[0] | null = null
 
   for (const segment of segments) {
-    if (!currentGroup || currentGroup.speaker !== segment.speaker) {
+    const speakerName = segment.speaker_name || segment.speaker_label
+    if (!currentGroup || currentGroup.speaker !== speakerName) {
       currentGroup = {
-        speaker: segment.speaker,
+        speaker: speakerName,
         role: segment.speaker_role,
         segments: [],
       }

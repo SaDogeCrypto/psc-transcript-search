@@ -23,6 +23,7 @@ export function Tabs({ active }: { active: string }) {
     { id: 'sources', label: 'Sources', href: '/sources' },
     { id: 'hearings', label: 'Hearings', href: '/hearings' },
     { id: 'runs', label: 'Pipeline Runs', href: '/runs' },
+    { id: 'review', label: 'Entity Review', href: '/review' },
   ];
 
   return (

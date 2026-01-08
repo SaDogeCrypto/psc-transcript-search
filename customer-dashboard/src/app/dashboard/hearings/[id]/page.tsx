@@ -14,26 +14,20 @@ import {
   AlertTriangle,
   TrendingUp,
   MessageSquare,
-  ChevronDown,
-  ChevronUp,
 } from 'lucide-react'
-import { getHearing, getTranscript, type HearingDetail, type Segment } from '@/lib/api'
+import { getHearing, type HearingDetail, type Segment } from '@/lib/api'
 import { formatDate, formatDuration } from '@/lib/utils'
 import { VideoPlayer, type VideoPlayerRef } from '@/components/video-player'
 import { TranscriptViewer } from '@/components/transcript-viewer'
 
 export default function HearingDetailPage() {
   const params = useParams()
-  const hearingId = parseInt(params.id as string)
+  const hearingId = params.id as string
 
   const videoRef = useRef<VideoPlayerRef>(null)
   const [hearing, setHearing] = useState<HearingDetail | null>(null)
-  const [segments, setSegments] = useState<Segment[]>([])
   const [currentTime, setCurrentTime] = useState(0)
   const [loading, setLoading] = useState(true)
-  const [transcriptPage, setTranscriptPage] = useState(1)
-  const [hasMoreSegments, setHasMoreSegments] = useState(true)
-  const [transcriptLoading, setTranscriptLoading] = useState(false)
 
   // Active tab for analysis sections
   const [activeTab, setActiveTab] = useState<'summary' | 'transcript' | 'analysis'>('summary')
@@ -42,13 +36,8 @@ export default function HearingDetailPage() {
     async function loadHearing() {
       setLoading(true)
       try {
-        const [hearingData, transcriptData] = await Promise.all([
-          getHearing(hearingId),
-          getTranscript(hearingId, 1, 50),
-        ])
+        const hearingData = await getHearing(hearingId)
         setHearing(hearingData)
-        setSegments(transcriptData.segments)
-        setHasMoreSegments(transcriptData.segments.length === 50)
       } catch (error) {
         console.error('Error loading hearing:', error)
       } finally {
@@ -59,25 +48,10 @@ export default function HearingDetailPage() {
     loadHearing()
   }, [hearingId])
 
-  const loadMoreSegments = async () => {
-    if (transcriptLoading) return
-    setTranscriptLoading(true)
-
-    try {
-      const nextPage = transcriptPage + 1
-      const data = await getTranscript(hearingId, nextPage, 50)
-      setSegments((prev) => [...prev, ...data.segments])
-      setTranscriptPage(nextPage)
-      setHasMoreSegments(data.segments.length === 50)
-    } catch (error) {
-      console.error('Error loading more segments:', error)
-    } finally {
-      setTranscriptLoading(false)
-    }
-  }
-
   const handleSegmentClick = (segment: Segment) => {
-    videoRef.current?.seekTo(segment.start_time)
+    if (segment.start_time !== null) {
+      videoRef.current?.seekTo(segment.start_time)
+    }
   }
 
   if (loading) {
@@ -101,6 +75,10 @@ export default function HearingDetailPage() {
     )
   }
 
+  const analysis = hearing.analysis
+  const segments = hearing.segments || []
+  const videoUrl = hearing.youtube_url || hearing.video_url
+
   return (
     <div className="space-y-6">
       {/* Back button and title */}
@@ -122,7 +100,7 @@ export default function HearingDetailPage() {
               </span>
             )}
           </div>
-          <h1 className="text-2xl font-bold text-gray-900">{hearing.title}</h1>
+          <h1 className="text-2xl font-bold text-gray-900">{hearing.title || 'Untitled Hearing'}</h1>
           <div className="flex flex-wrap items-center gap-4 mt-2 text-sm text-gray-500">
             <span className="flex items-center gap-1">
               <Calendar className="h-4 w-4" />
@@ -134,15 +112,15 @@ export default function HearingDetailPage() {
                 {formatDuration(hearing.duration_seconds)}
               </span>
             )}
-            {hearing.utility_name && (
+            {(analysis?.utility_name || hearing.utility_name) && (
               <span className="flex items-center gap-1">
                 <Building2 className="h-4 w-4" />
-                {hearing.utility_name}
+                {analysis?.utility_name || hearing.utility_name}
               </span>
             )}
-            {hearing.source_url && (
+            {videoUrl && (
               <a
-                href={hearing.source_url}
+                href={videoUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1 text-blue-600 hover:underline"
@@ -159,10 +137,10 @@ export default function HearingDetailPage() {
       <div className="grid lg:grid-cols-2 gap-6">
         {/* Video Section */}
         <div className="space-y-4">
-          {hearing.video_url ? (
+          {videoUrl ? (
             <VideoPlayer
               ref={videoRef}
-              src={hearing.video_url}
+              src={videoUrl}
               onTimeUpdate={setCurrentTime}
             />
           ) : (
@@ -172,9 +150,11 @@ export default function HearingDetailPage() {
           )}
 
           {/* One-sentence summary */}
-          {hearing.one_sentence_summary && (
+          {(analysis?.one_sentence_summary || hearing.one_sentence_summary) && (
             <div className="p-4 bg-blue-50 rounded-lg border border-blue-100">
-              <p className="text-blue-900 font-medium">{hearing.one_sentence_summary}</p>
+              <p className="text-blue-900 font-medium">
+                {analysis?.one_sentence_summary || hearing.one_sentence_summary}
+              </p>
             </div>
           )}
         </div>
@@ -220,22 +200,22 @@ export default function HearingDetailPage() {
             {activeTab === 'summary' && (
               <div className="p-4 overflow-y-auto h-full space-y-6">
                 {/* Full Summary */}
-                {hearing.summary && (
+                {analysis?.summary && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2">Summary</h3>
-                    <p className="text-gray-700 whitespace-pre-wrap">{hearing.summary}</p>
+                    <p className="text-gray-700 whitespace-pre-wrap">{analysis.summary}</p>
                   </div>
                 )}
 
                 {/* Key Issues */}
-                {hearing.issues && hearing.issues.length > 0 && (
+                {analysis?.issues && analysis.issues.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2 flex items-center gap-2">
                       <AlertTriangle className="h-4 w-4" />
                       Key Issues
                     </h3>
                     <div className="space-y-2">
-                      {hearing.issues.map((issue, i) => (
+                      {analysis.issues.map((issue, i) => (
                         <div key={i} className="p-3 bg-gray-50 rounded-lg">
                           <p className="font-medium text-gray-900">{issue.issue}</p>
                           <p className="text-sm text-gray-600 mt-1">{issue.description}</p>
@@ -246,14 +226,14 @@ export default function HearingDetailPage() {
                 )}
 
                 {/* Notable Quotes */}
-                {hearing.quotes && hearing.quotes.length > 0 && (
+                {analysis?.quotes && analysis.quotes.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2 flex items-center gap-2">
                       <MessageSquare className="h-4 w-4" />
                       Notable Quotes
                     </h3>
                     <div className="space-y-3">
-                      {hearing.quotes.map((quote, i) => (
+                      {analysis.quotes.map((quote, i) => (
                         <div key={i} className="border-l-4 border-blue-400 pl-4 py-2">
                           <p className="text-gray-700 italic">"{quote.quote}"</p>
                           <p className="text-sm text-gray-500 mt-1">
@@ -264,6 +244,14 @@ export default function HearingDetailPage() {
                     </div>
                   </div>
                 )}
+
+                {/* No analysis yet */}
+                {!analysis && (
+                  <div className="text-center py-8 text-gray-500">
+                    <FileText className="h-12 w-12 mx-auto mb-4 text-gray-300" />
+                    <p>Analysis not yet available for this hearing.</p>
+                  </div>
+                )}
               </div>
             )}
 
@@ -272,23 +260,20 @@ export default function HearingDetailPage() {
                 segments={segments}
                 currentTime={currentTime}
                 onSegmentClick={handleSegmentClick}
-                loading={transcriptLoading}
-                hasMore={hasMoreSegments}
-                onLoadMore={loadMoreSegments}
               />
             )}
 
             {activeTab === 'analysis' && (
               <div className="p-4 overflow-y-auto h-full space-y-6">
                 {/* Participants */}
-                {hearing.participants && hearing.participants.length > 0 && (
+                {analysis?.participants && analysis.participants.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2 flex items-center gap-2">
                       <Users className="h-4 w-4" />
                       Participants
                     </h3>
                     <div className="flex flex-wrap gap-2">
-                      {hearing.participants.map((p, i) => (
+                      {analysis.participants.map((p, i) => (
                         <span
                           key={i}
                           className="px-3 py-1.5 bg-gray-100 rounded-full text-sm"
@@ -304,13 +289,13 @@ export default function HearingDetailPage() {
                 )}
 
                 {/* Commissioner Concerns */}
-                {hearing.commissioner_concerns && hearing.commissioner_concerns.length > 0 && (
+                {analysis?.commissioner_concerns && analysis.commissioner_concerns.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2">
                       Commissioner Concerns
                     </h3>
                     <div className="space-y-2">
-                      {hearing.commissioner_concerns.map((concern, i) => (
+                      {analysis.commissioner_concerns.map((concern, i) => (
                         <div key={i} className="p-3 bg-yellow-50 border border-yellow-100 rounded-lg">
                           <p className="font-medium text-gray-900">{concern.commissioner}</p>
                           <p className="text-sm text-gray-700 mt-1">{concern.concern}</p>
@@ -321,34 +306,34 @@ export default function HearingDetailPage() {
                 )}
 
                 {/* Commissioner Mood */}
-                {hearing.commissioner_mood && (
+                {analysis?.commissioner_mood && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2">
                       Overall Commissioner Sentiment
                     </h3>
                     <span className={`px-3 py-1.5 rounded-full text-sm font-medium ${
-                      hearing.commissioner_mood === 'supportive'
+                      analysis.commissioner_mood === 'supportive'
                         ? 'bg-green-100 text-green-700'
-                        : hearing.commissioner_mood === 'skeptical'
+                        : analysis.commissioner_mood === 'skeptical'
                         ? 'bg-yellow-100 text-yellow-700'
-                        : hearing.commissioner_mood === 'hostile'
+                        : analysis.commissioner_mood === 'hostile'
                         ? 'bg-red-100 text-red-700'
                         : 'bg-gray-100 text-gray-700'
                     }`}>
-                      {hearing.commissioner_mood}
+                      {analysis.commissioner_mood}
                     </span>
                   </div>
                 )}
 
                 {/* Commitments */}
-                {hearing.commitments && hearing.commitments.length > 0 && (
+                {analysis?.commitments && analysis.commitments.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2 flex items-center gap-2">
                       <FileText className="h-4 w-4" />
                       Commitments Made
                     </h3>
                     <div className="space-y-2">
-                      {hearing.commitments.map((c, i) => (
+                      {analysis.commitments.map((c, i) => (
                         <div key={i} className="p-3 bg-green-50 border border-green-100 rounded-lg">
                           <p className="font-medium text-gray-900">{c.commitment}</p>
                           <p className="text-sm text-gray-600 mt-1">{c.context}</p>
@@ -359,17 +344,17 @@ export default function HearingDetailPage() {
                 )}
 
                 {/* Likely Outcome */}
-                {hearing.likely_outcome && (
+                {analysis?.likely_outcome && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2 flex items-center gap-2">
                       <TrendingUp className="h-4 w-4" />
                       Likely Outcome
                     </h3>
                     <div className="p-4 bg-blue-50 border border-blue-100 rounded-lg">
-                      <p className="text-gray-700">{hearing.likely_outcome}</p>
-                      {hearing.outcome_confidence && (
+                      <p className="text-gray-700">{analysis.likely_outcome}</p>
+                      {analysis.outcome_confidence && (
                         <p className="text-sm text-gray-500 mt-2">
-                          Confidence: {Math.round(hearing.outcome_confidence * 100)}%
+                          Confidence: {Math.round(analysis.outcome_confidence * 100)}%
                         </p>
                       )}
                     </div>
@@ -377,23 +362,27 @@ export default function HearingDetailPage() {
                 )}
 
                 {/* Risk Factors */}
-                {hearing.risk_factors && hearing.risk_factors.length > 0 && (
+                {analysis?.risk_factors && analysis.risk_factors.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium text-gray-500 mb-2 flex items-center gap-2">
                       <AlertTriangle className="h-4 w-4" />
                       Risk Factors
                     </h3>
                     <div className="space-y-2">
-                      {hearing.risk_factors.map((risk, i) => (
+                      {analysis.risk_factors.map((risk, i) => (
                         <div key={i} className="p-3 bg-red-50 border border-red-100 rounded-lg">
-                          <p className="font-medium text-gray-900">{risk.factor}</p>
-                          <div className="flex gap-4 mt-1 text-sm text-gray-600">
-                            <span>Likelihood: {risk.likelihood}</span>
-                            <span>Impact: {risk.impact}</span>
-                          </div>
+                          <p className="font-medium text-gray-900">{risk}</p>
                         </div>
                       ))}
                     </div>
+                  </div>
+                )}
+
+                {/* No analysis yet */}
+                {!analysis && (
+                  <div className="text-center py-8 text-gray-500">
+                    <FileText className="h-12 w-12 mx-auto mb-4 text-gray-300" />
+                    <p>Analysis not yet available for this hearing.</p>
                   </div>
                 )}
               </div>

@@ -19,6 +19,7 @@ from florida.scraper import (
     start_scraper_async,
     stop_scraper as _stop_scraper,
 )
+from florida.pipeline.stages import FLTranscribeStage, FLAnalyzeStage
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -527,25 +528,323 @@ def get_pipeline_status(db: Session = Depends(get_db)):
     )
 
 
+class PipelineStartRequest(BaseModel):
+    only_stage: Optional[str] = None  # transcribe, analyze, or None for full pipeline
+    states: Optional[List[str]] = None  # State codes to filter (ignored for FL-only API)
+    max_cost: Optional[float] = None  # Maximum cost limit
+    limit: int = 10  # Max hearings to process
+
+
+def _run_pipeline_stages(
+    stage: Optional[str],
+    limit: int,
+    max_cost: Optional[float],
+    db_session_factory
+):
+    """Background task to run pipeline stages."""
+    from florida.models import SessionLocal
+    db = db_session_factory()
+
+    try:
+        _pipeline_state["status"] = "running"
+        _pipeline_state["hearings_processed"] = 0
+        _pipeline_state["errors_count"] = 0
+
+        stages_to_run = [stage] if stage else ["transcribe", "analyze"]
+        total_cost = 0.0
+
+        for current_stage in stages_to_run:
+            if _pipeline_state["status"] == "stopping":
+                break
+
+            _pipeline_state["current_stage"] = current_stage
+
+            # Initialize stage
+            if current_stage == "transcribe":
+                pipeline_stage = FLTranscribeStage()
+                # Find hearings needing transcription (no segments yet)
+                hearings = db.execute(text("""
+                    SELECT h.id FROM fl_hearings h
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM fl_transcript_segments s WHERE s.hearing_id = h.id
+                    )
+                    AND (h.transcript_status IS NULL OR h.transcript_status NOT IN ('transcribed', 'analyzed', 'error', 'skipped'))
+                    LIMIT :limit
+                """), {"limit": limit}).fetchall()
+                hearing_ids = [r[0] for r in hearings]
+
+            elif current_stage == "analyze":
+                pipeline_stage = FLAnalyzeStage()
+                # Find hearings needing analysis (have segments but no analysis)
+                hearings = db.execute(text("""
+                    SELECT DISTINCT h.id FROM fl_hearings h
+                    JOIN fl_transcript_segments s ON s.hearing_id = h.id
+                    LEFT JOIN fl_analyses a ON a.hearing_id = h.id
+                    WHERE a.id IS NULL
+                    LIMIT :limit
+                """), {"limit": limit}).fetchall()
+                hearing_ids = [r[0] for r in hearings]
+            else:
+                continue
+
+            # Process each hearing
+            for hearing_id in hearing_ids:
+                if _pipeline_state["status"] == "stopping":
+                    break
+
+                if max_cost and total_cost >= max_cost:
+                    break
+
+                hearing = db.query(FLHearing).filter(FLHearing.id == hearing_id).first()
+                if not hearing:
+                    continue
+
+                _pipeline_state["current_hearing_id"] = hearing.id
+
+                try:
+                    is_valid, validation_error = pipeline_stage.validate(hearing, db)
+                    if not is_valid:
+                        continue
+
+                    result = pipeline_stage.execute(hearing, db)
+
+                    if result.success:
+                        _pipeline_state["hearings_processed"] += 1
+                        total_cost += result.cost_usd
+                    else:
+                        _pipeline_state["errors_count"] += 1
+
+                except Exception as e:
+                    _pipeline_state["errors_count"] += 1
+
+        _pipeline_state["status"] = "idle"
+        _pipeline_state["current_stage"] = None
+        _pipeline_state["current_hearing_id"] = None
+
+    except Exception as e:
+        _pipeline_state["status"] = "error"
+        _pipeline_state["errors_count"] += 1
+    finally:
+        db.close()
+
+
 @router.post("/pipeline/start")
 def start_pipeline(
+    request: PipelineStartRequest,
     background_tasks: BackgroundTasks,
-    stages: Optional[str] = Query(None, description="Comma-separated stages: transcribe,analyze"),
-    limit: int = Query(10, description="Max hearings to process"),
     db: Session = Depends(get_db)
 ):
-    """Start the pipeline (for demo, this just updates status)."""
+    """
+    Start the pipeline to process hearings.
+
+    Accepts JSON body:
+    - only_stage: "transcribe" or "analyze" (optional, runs both if not specified)
+    - limit: Max hearings to process (default 10)
+    - max_cost: Maximum USD to spend (optional)
+    """
     if _pipeline_state["status"] == "running":
         raise HTTPException(status_code=409, detail="Pipeline is already running")
 
-    _pipeline_state["status"] = "running"
+    _pipeline_state["status"] = "starting"
     _pipeline_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    _pipeline_state["current_stage"] = request.only_stage
+
+    # Get the session factory for background task
+    from florida.models import SessionLocal
+
+    # Run in background
+    background_tasks.add_task(
+        _run_pipeline_stages,
+        request.only_stage,
+        request.limit,
+        request.max_cost,
+        SessionLocal
+    )
 
     return {
         "message": "Pipeline started",
-        "stages": stages.split(",") if stages else ["transcribe", "analyze"],
-        "limit": limit,
-        "status": "running"
+        "stages": [request.only_stage] if request.only_stage else ["transcribe", "analyze"],
+        "limit": request.limit,
+        "max_cost": request.max_cost,
+        "status": "starting"
+    }
+
+
+# Dashboard compatibility endpoint
+class PipelineRunRequest(BaseModel):
+    stage: str
+    state_code: Optional[str] = None
+    hearing_ids: Optional[List[int]] = None
+    limit: int = 5
+
+
+@router.post("/pipeline/run")
+def run_pipeline_compat(
+    request: PipelineRunRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Run pipeline (dashboard compatibility endpoint).
+
+    Maps to the start endpoint with appropriate parameters.
+    """
+    from florida.models import SessionLocal
+
+    # Find hearings needing this stage
+    if request.stage == "transcribe":
+        hearings = db.execute(text("""
+            SELECT h.id FROM fl_hearings h
+            WHERE NOT EXISTS (
+                SELECT 1 FROM fl_transcript_segments s WHERE s.hearing_id = h.id
+            )
+            AND (h.transcript_status IS NULL OR h.transcript_status NOT IN ('transcribed', 'analyzed', 'error', 'skipped'))
+            LIMIT :limit
+        """), {"limit": request.limit}).fetchall()
+    elif request.stage == "analyze":
+        hearings = db.execute(text("""
+            SELECT DISTINCT h.id FROM fl_hearings h
+            JOIN fl_transcript_segments s ON s.hearing_id = h.id
+            LEFT JOIN fl_analyses a ON a.hearing_id = h.id
+            WHERE a.id IS NULL
+            LIMIT :limit
+        """), {"limit": request.limit}).fetchall()
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown stage: {request.stage}")
+
+    hearing_ids = [r[0] for r in hearings]
+
+    if not hearing_ids:
+        return {
+            "status": "completed",
+            "stage": request.stage,
+            "total": 0,
+            "successful": 0,
+            "failed": 0,
+            "total_cost_usd": 0,
+            "errors": []
+        }
+
+    # Run in background
+    _pipeline_state["status"] = "running"
+    _pipeline_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    _pipeline_state["current_stage"] = request.stage
+
+    background_tasks.add_task(
+        _run_pipeline_stages,
+        request.stage,
+        request.limit,
+        None,
+        SessionLocal
+    )
+
+    return {
+        "status": "running",
+        "stage": request.stage,
+        "total": len(hearing_ids),
+        "successful": 0,
+        "failed": 0,
+        "total_cost_usd": 0,
+        "started_at": _pipeline_state["started_at"]
+    }
+
+
+@router.get("/pipeline/stats")
+def get_pipeline_stats(
+    state_code: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Get pipeline statistics (dashboard compatibility)."""
+    # Count hearings by transcript_status
+    status_counts = {}
+
+    # Pending = no transcript segments
+    pending = db.execute(text("""
+        SELECT COUNT(*) FROM fl_hearings h
+        WHERE NOT EXISTS (SELECT 1 FROM fl_transcript_segments s WHERE s.hearing_id = h.id)
+    """)).scalar() or 0
+    status_counts["pending"] = pending
+
+    # Transcribed = has segments but no analysis
+    transcribed = db.execute(text("""
+        SELECT COUNT(DISTINCT h.id) FROM fl_hearings h
+        JOIN fl_transcript_segments s ON s.hearing_id = h.id
+        LEFT JOIN fl_analyses a ON a.hearing_id = h.id
+        WHERE a.id IS NULL
+    """)).scalar() or 0
+    status_counts["transcribed"] = transcribed
+
+    # Analyzed = has analysis
+    analyzed = db.query(func.count(FLAnalysis.id)).scalar() or 0
+    status_counts["analyzed"] = analyzed
+
+    # Errors
+    errors = db.query(func.count(FLHearing.id)).filter(
+        FLHearing.transcript_status == 'error'
+    ).scalar() or 0
+    status_counts["error"] = errors
+
+    total_hearings = db.query(func.count(FLHearing.id)).scalar() or 0
+    total_cost = db.query(func.sum(FLAnalysis.cost_usd)).scalar() or 0
+
+    return {
+        "status_counts": status_counts,
+        "total_hearings": total_hearings,
+        "total_processing_cost_usd": float(total_cost or 0)
+    }
+
+
+@router.get("/pipeline/pending")
+def get_pending_hearings(
+    stage: str = Query(...),
+    state_code: Optional[str] = None,
+    limit: int = 20,
+    db: Session = Depends(get_db)
+):
+    """Get hearings pending for a specific stage."""
+    if stage == "transcribe":
+        hearings = db.execute(text("""
+            SELECT h.id, h.title, NULL as docket_number, h.hearing_date, h.transcript_status
+            FROM fl_hearings h
+            WHERE NOT EXISTS (
+                SELECT 1 FROM fl_transcript_segments s WHERE s.hearing_id = h.id
+            )
+            AND (h.transcript_status IS NULL OR h.transcript_status NOT IN ('transcribed', 'analyzed', 'error', 'skipped'))
+            ORDER BY h.hearing_date DESC
+            LIMIT :limit
+        """), {"limit": limit}).fetchall()
+    elif stage == "analyze":
+        hearings = db.execute(text("""
+            SELECT DISTINCT h.id, h.title, NULL as docket_number, h.hearing_date, h.transcript_status
+            FROM fl_hearings h
+            JOIN fl_transcript_segments s ON s.hearing_id = h.id
+            LEFT JOIN fl_analyses a ON a.hearing_id = h.id
+            WHERE a.id IS NULL
+            ORDER BY h.hearing_date DESC
+            LIMIT :limit
+        """), {"limit": limit}).fetchall()
+    else:
+        hearings = []
+
+    items = []
+    for h in hearings:
+        # Handle both datetime objects and strings (SQLite returns strings)
+        hearing_date = h[3]
+        if hearing_date and hasattr(hearing_date, 'isoformat'):
+            hearing_date = hearing_date.isoformat()
+        items.append({
+            "id": str(h[0]),
+            "title": h[1],
+            "docket_number": h[2],
+            "hearing_date": hearing_date,
+            "transcript_status": h[4]
+        })
+
+    return {
+        "stage": stage,
+        "state_code": state_code,
+        "count": len(items),
+        "hearings": items
     }
 
 
@@ -704,11 +1003,13 @@ def run_pipeline_stage(
     db: Session = Depends(get_db)
 ):
     """
-    Trigger a specific pipeline stage on selected hearings.
+    Execute a specific pipeline stage on selected hearings.
 
     Supported stages:
-    - transcribe: Queue hearings for transcription
-    - analyze: Queue hearings for analysis
+    - transcribe: Transcribe audio using Whisper (Groq/OpenAI/Azure)
+    - analyze: Analyze transcript using GPT-4o-mini
+
+    This endpoint executes the stages directly, not via batch scripts.
     """
     stage = request.stage
     hearing_ids = request.hearing_ids
@@ -728,54 +1029,67 @@ def run_pipeline_stage(
     if not hearings:
         raise HTTPException(status_code=404, detail="No hearings found with provided IDs")
 
+    # Initialize the appropriate stage
+    if stage == "transcribe":
+        pipeline_stage = FLTranscribeStage()
+    else:
+        pipeline_stage = FLAnalyzeStage()
+
     processed = []
     errors = []
+    total_cost = 0.0
 
     for hearing in hearings:
         try:
-            if stage == "transcribe":
-                # Mark hearing as ready for transcription
-                # The actual transcription happens via batch_transcribe.py
-                if hearing.status == "pending":
-                    processed.append({"id": hearing.id, "title": hearing.title[:50]})
-                else:
-                    errors.append({"id": hearing.id, "error": f"Cannot transcribe: status is {hearing.status}"})
+            # Validate the hearing for this stage
+            is_valid, validation_error = pipeline_stage.validate(hearing, db)
 
-            elif stage == "analyze":
-                # Check if hearing has transcript segments
-                segment_count = db.query(func.count(FLTranscriptSegment.id)).filter(
-                    FLTranscriptSegment.hearing_id == hearing.id
-                ).scalar()
+            if not is_valid:
+                errors.append({
+                    "id": hearing.id,
+                    "title": hearing.title[:50] if hearing.title else f"Hearing {hearing.id}",
+                    "error": validation_error
+                })
+                continue
 
-                if segment_count > 0:
-                    # Check if already analyzed
-                    existing_analysis = db.query(FLAnalysis).filter(
-                        FLAnalysis.hearing_id == hearing.id
-                    ).first()
+            # Execute the stage
+            result = pipeline_stage.execute(hearing, db)
 
-                    if existing_analysis:
-                        errors.append({"id": hearing.id, "error": "Already analyzed"})
-                    else:
-                        # Mark as ready for analysis (status transcribed -> will be picked up by batch_analyze)
-                        if hearing.status != "analyzed":
-                            hearing.status = "transcribed"
-                            processed.append({"id": hearing.id, "title": hearing.title[:50]})
-                        else:
-                            errors.append({"id": hearing.id, "error": "Already analyzed"})
-                else:
-                    errors.append({"id": hearing.id, "error": "No transcript segments found"})
+            if result.success:
+                processed.append({
+                    "id": hearing.id,
+                    "title": hearing.title[:50] if hearing.title else f"Hearing {hearing.id}",
+                    "cost_usd": result.cost_usd,
+                    "skipped": getattr(result, 'error', '') == 'Already transcribed (skipped)' or
+                               getattr(result, 'error', '') == 'Already analyzed (skipped)'
+                })
+                total_cost += result.cost_usd
+            else:
+                errors.append({
+                    "id": hearing.id,
+                    "title": hearing.title[:50] if hearing.title else f"Hearing {hearing.id}",
+                    "error": result.error
+                })
 
         except Exception as e:
-            errors.append({"id": hearing.id, "error": str(e)})
-
-    db.commit()
+            errors.append({
+                "id": hearing.id,
+                "title": hearing.title[:50] if hearing.title else f"Hearing {hearing.id}",
+                "error": str(e)
+            })
 
     return {
-        "message": f"Queued {len(processed)} hearings for {stage}",
+        "message": f"Processed {len(processed)} hearings for {stage}",
         "stage": stage,
         "processed": processed,
         "errors": errors,
-        "note": f"Run 'python scripts/batch_{stage}.py' to process these hearings"
+        "total_cost_usd": round(total_cost, 4),
+        "summary": {
+            "total_requested": len(hearing_ids),
+            "successful": len(processed),
+            "failed": len(errors),
+            "skipped": sum(1 for p in processed if p.get("skipped", False))
+        }
     }
 
 
@@ -799,6 +1113,44 @@ def create_schedule():
 # SCRAPER (Florida Channel RSS Scraper)
 # ============================================================================
 
+# Compatibility endpoint for admin dashboard
+@router.get("/scrapers")
+def list_scrapers():
+    """List available scrapers by state (dashboard compatibility)."""
+    return {"FL": ["rss"]}
+
+
+@router.post("/scrapers/run")
+def run_scraper_compat(
+    state_code: str = Query(...),
+    scraper: str = Query(...),
+    days_back: int = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Run a scraper (dashboard compatibility endpoint)."""
+    if state_code != "FL" or scraper != "rss":
+        raise HTTPException(status_code=404, detail=f"Scraper {state_code}/{scraper} not found")
+
+    # Run the scraper
+    result = start_scraper_async(dry_run=False)
+
+    # Wait a moment for it to complete since it's fast
+    import time
+    time.sleep(2)
+
+    # Get final status
+    status = _get_scraper_status()
+
+    return {
+        "state_code": "FL",
+        "scraper": "rss",
+        "status": status.get("status", "completed"),
+        "items_found": status.get("items_found", 0),
+        "hearings_created": status.get("new_hearings", 0),
+        "errors": status.get("errors", [])
+    }
+
+
 @router.get("/scraper/status")
 def get_scraper_status():
     """Get current scraper status."""
@@ -820,19 +1172,54 @@ def stop_scraper():
 
 
 # ============================================================================
-# DOCKET DISCOVERY (Stub endpoints)
+# DOCKET DISCOVERY
 # ============================================================================
 
+# Track docket discovery status
+_docket_discovery_status = {
+    "status": "idle",
+    "last_run": None,
+    "last_count": 0,
+    "errors": []
+}
+
 @router.get("/pipeline/docket-sources")
-def get_docket_sources():
-    """Get docket sources (stub)."""
-    return []
+def get_docket_sources(db: Session = Depends(get_db)):
+    """Get docket sources for Florida PSC."""
+    from florida.scrapers.clerkoffice import FloridaClerkOfficeScraper
+
+    # Check if scraper is available
+    scraper = FloridaClerkOfficeScraper()
+    is_connected = False
+    try:
+        is_connected = scraper.test_connection()
+    except:
+        pass
+
+    # Count existing dockets
+    docket_count = db.query(func.count(FLDocket.id)).scalar() or 0
+
+    return [{
+        "id": 1,
+        "state_code": "FL",
+        "state_name": "Florida",
+        "commission_name": "Florida Public Service Commission",
+        "search_url": "https://www.psc.state.fl.us/ClerkOffice/DocketSearch",
+        "scraper_type": "api_json",
+        "api_url": "https://pscweb.floridapsc.com/api/ClerkOffice",
+        "enabled": True,
+        "connected": is_connected,
+        "last_scraped_at": _docket_discovery_status.get("last_run"),
+        "last_scrape_count": _docket_discovery_status.get("last_count"),
+        "docket_count": docket_count,
+        "status": "active" if is_connected else "disconnected"
+    }]
 
 
 @router.post("/pipeline/docket-sources/{source_id}/toggle")
 def toggle_docket_source(source_id: int):
-    """Toggle docket source (stub)."""
-    return {"message": "Not implemented", "source_id": source_id}
+    """Toggle docket source (Florida only has one source)."""
+    return {"message": "Florida source is always enabled", "source_id": source_id, "enabled": True}
 
 
 @router.get("/pipeline/data-quality")
@@ -843,6 +1230,7 @@ def get_data_quality(db: Session = Depends(get_db)):
         SELECT COUNT(DISTINCT hearing_id) FROM fl_transcript_segments
     """)).scalar() or 0
     with_analysis = db.query(func.count(FLAnalysis.id)).scalar() or 0
+    total_dockets = db.query(func.count(FLDocket.id)).scalar() or 0
 
     return {
         "total_hearings": total_hearings,
@@ -850,7 +1238,7 @@ def get_data_quality(db: Session = Depends(get_db)):
         "hearings_with_analysis": with_analysis,
         "transcript_coverage": round(with_transcripts / total_hearings * 100, 1) if total_hearings > 0 else 0,
         "analysis_coverage": round(with_analysis / total_hearings * 100, 1) if total_hearings > 0 else 0,
-        "dockets_total": 0,
+        "dockets_total": total_dockets,
         "dockets_matched": 0,
         "utilities_total": 0,
         "utilities_matched": 0,
@@ -861,7 +1249,7 @@ def get_data_quality(db: Session = Depends(get_db)):
             "possible": with_transcripts - with_analysis,  # Transcribed but not analyzed
             "unverified": total_hearings - with_transcripts  # No transcript yet
         },
-        "known_dockets": 0,
+        "known_dockets": total_dockets,
         "docket_sources": {
             "total": 1,
             "enabled": 1
@@ -870,26 +1258,393 @@ def get_data_quality(db: Session = Depends(get_db)):
 
 
 @router.get("/pipeline/docket-discovery/stats")
-def get_docket_discovery_stats():
-    """Get docket discovery stats (stub)."""
+def get_docket_discovery_stats(db: Session = Depends(get_db)):
+    """Get docket discovery statistics."""
+    total_dockets = db.query(func.count(FLDocket.id)).scalar() or 0
+    open_dockets = db.query(func.count(FLDocket.id)).filter(FLDocket.status == 'open').scalar() or 0
+
+    # Get dockets by sector (sector_code might be null, so also try industry_type)
+    sector_counts = db.execute(text("""
+        SELECT COALESCE(sector_code, UPPER(LEFT(industry_type, 1)), 'X') as sector, COUNT(*) as count
+        FROM fl_dockets
+        GROUP BY sector
+        HAVING COUNT(*) > 0
+    """)).fetchall()
+
+    by_sector = {row[0]: row[1] for row in sector_counts if row[0]}
+
+    # Get dockets by year
+    year_counts = db.execute(text("""
+        SELECT year, COUNT(*) as count
+        FROM fl_dockets
+        WHERE year IS NOT NULL
+        GROUP BY year
+        ORDER BY year DESC
+    """)).fetchall()
+
+    by_year = {str(row[0]): row[1] for row in year_counts}
+
     return {
-        "total_dockets": 0,
-        "matched_dockets": 0,
-        "pending_dockets": 0,
-        "last_run": None
+        "total_dockets": total_dockets,
+        "open_dockets": open_dockets,
+        "closed_dockets": total_dockets - open_dockets,
+        "by_sector": by_sector,
+        "by_year": by_year,
+        "last_run": _docket_discovery_status.get("last_run"),
+        "last_count": _docket_discovery_status.get("last_count"),
+        "status": _docket_discovery_status.get("status")
     }
 
 
 @router.get("/pipeline/docket-discovery/scrapers")
 def get_docket_scrapers():
-    """Get docket scrapers (stub)."""
-    return []
+    """Get available docket scrapers."""
+    return [{
+        "state_code": "FL",
+        "state_name": "Florida",
+        "scraper_type": "api_json",
+        "batch_available": True,
+        "individual_available": True,
+        "api_url": "https://pscweb.floridapsc.com/api/ClerkOffice"
+    }]
 
 
 @router.post("/pipeline/docket-discovery/start")
-def start_docket_discovery(states: Optional[str] = None):
-    """Start docket discovery (stub)."""
-    return {"message": "Docket discovery not implemented", "status": "unavailable"}
+def start_docket_discovery(
+    year: Optional[int] = None,
+    status: Optional[str] = None,
+    limit: int = 500,
+    db: Session = Depends(get_db)
+):
+    """
+    Start docket discovery for Florida PSC.
+
+    Args:
+        year: Optional year filter (e.g., 2024)
+        status: Optional status filter ('open', 'closed')
+        limit: Maximum dockets to fetch (default 500)
+    """
+    from datetime import datetime
+    from florida.scrapers.clerkoffice import FloridaClerkOfficeScraper
+
+    global _docket_discovery_status
+    _docket_discovery_status["status"] = "running"
+    _docket_discovery_status["errors"] = []
+
+    try:
+        scraper = FloridaClerkOfficeScraper()
+
+        # Test connection first
+        if not scraper.test_connection():
+            _docket_discovery_status["status"] = "error"
+            _docket_discovery_status["errors"].append("Failed to connect to Florida PSC API")
+            return {"status": "error", "message": "Failed to connect to Florida PSC API"}
+
+        # Scrape dockets
+        new_count = 0
+        updated_count = 0
+        total_count = 0
+
+        for docket_data in scraper.scrape_florida_dockets(year=year, status=status, limit=limit):
+            total_count += 1
+
+            # Check if docket exists
+            existing = db.query(FLDocket).filter(
+                FLDocket.docket_number == docket_data.docket_number
+            ).first()
+
+            if existing:
+                # Update existing docket
+                existing.title = docket_data.title or existing.title
+                existing.utility_name = docket_data.utility_name or existing.utility_name
+                existing.status = docket_data.status or existing.status
+                existing.case_type = docket_data.case_type or existing.case_type
+                existing.industry_type = docket_data.industry_type or existing.industry_type
+                existing.filed_date = docket_data.filed_date or existing.filed_date
+                existing.closed_date = docket_data.closed_date or existing.closed_date
+                existing.psc_docket_url = docket_data.psc_docket_url or existing.psc_docket_url
+                existing.updated_at = datetime.utcnow()
+                updated_count += 1
+            else:
+                # Create new docket
+                new_docket = FLDocket(
+                    docket_number=docket_data.docket_number,
+                    year=docket_data.year,
+                    sequence=docket_data.sequence,
+                    sector_code=docket_data.sector_code,
+                    title=docket_data.title,
+                    utility_name=docket_data.utility_name,
+                    status=docket_data.status,
+                    case_type=docket_data.case_type,
+                    industry_type=docket_data.industry_type,
+                    filed_date=docket_data.filed_date,
+                    closed_date=docket_data.closed_date,
+                    psc_docket_url=docket_data.psc_docket_url,
+                )
+                db.add(new_docket)
+                new_count += 1
+
+            # Commit in batches
+            if total_count % 50 == 0:
+                db.commit()
+
+        db.commit()
+
+        _docket_discovery_status["status"] = "idle"
+        _docket_discovery_status["last_run"] = datetime.utcnow().isoformat()
+        _docket_discovery_status["last_count"] = total_count
+
+        return {
+            "status": "success",
+            "total_scraped": total_count,
+            "new_dockets": new_count,
+            "updated_dockets": updated_count,
+            "year_filter": year,
+            "status_filter": status
+        }
+
+    except Exception as e:
+        _docket_discovery_status["status"] = "error"
+        _docket_discovery_status["errors"].append(str(e))
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Docket discovery failed: {str(e)}")
+
+
+@router.get("/pipeline/docket-discovery/verify")
+def verify_docket(
+    docket_number: str,
+    save: bool = False,
+    db: Session = Depends(get_db)
+):
+    """
+    Verify a single docket number against Florida PSC.
+
+    Args:
+        docket_number: Docket number to verify (e.g., "20250001-EI" or "20250001")
+        save: Whether to save the docket to the database
+    """
+    from florida.scrapers.clerkoffice import FloridaClerkOfficeClient
+    import re
+
+    # Normalize docket number - strip any sector suffix for the API call
+    clean_number = re.sub(r'-[A-Z]{2}$', '', docket_number.strip())
+
+    client = FloridaClerkOfficeClient()
+    try:
+        details = client.get_docket_details(clean_number)
+
+        if not details:
+            return {
+                "valid": False,
+                "docket_number": docket_number,
+                "error": "Docket not found in Florida PSC system"
+            }
+
+        # Navigate the nested response structure
+        inner_result = details.get('result', {})
+        docket_events = inner_result.get('docketEventDetails', [])
+
+        if not docket_events:
+            return {
+                "valid": False,
+                "docket_number": docket_number,
+                "error": "No docket details returned from PSC"
+            }
+
+        # Get first event (primary docket info)
+        event = docket_events[0]
+        docket_num = event.get('docketnum', clean_number)
+        title = event.get('docketTitle', '')
+        case_status = event.get('casestatus', 0)
+        status = 'open' if case_status == 1 else 'closed'
+        filed_date = event.get('dueDate', event.get('completionDate'))
+
+        # Parse filed date
+        if filed_date and filed_date != '0001-01-01T00:00:00':
+            try:
+                from datetime import datetime
+                if 'T' in str(filed_date):
+                    filed_date = datetime.fromisoformat(filed_date.replace('Z', '')).strftime('%Y-%m-%d')
+            except:
+                pass
+
+    except Exception as e:
+        return {
+            "valid": False,
+            "docket_number": docket_number,
+            "error": f"API error: {str(e)}"
+        }
+
+    # Build the response
+    result = {
+        "valid": True,
+        "docket_number": docket_num,
+        "title": title,
+        "status": status,
+        "filed_date": filed_date if filed_date != '0001-01-01T00:00:00' else None,
+    }
+
+    if save:
+        from datetime import datetime
+
+        existing = db.query(FLDocket).filter(
+            FLDocket.docket_number == docket_num
+        ).first()
+
+        if existing:
+            result["saved"] = False
+            result["message"] = "Docket already exists in database"
+        else:
+            # Parse year from docket number
+            try:
+                year = int(docket_num[:4])
+            except:
+                year = datetime.now().year
+
+            new_docket = FLDocket(
+                docket_number=docket_num,
+                year=year,
+                title=title,
+                status=status,
+                psc_docket_url=f"https://www.psc.state.fl.us/ClerkOffice/DocketFiling?docket={docket_num}",
+            )
+            db.add(new_docket)
+            db.commit()
+            result["saved"] = True
+            result["message"] = "Docket saved to database"
+
+    return result
+
+
+@router.get("/dockets")
+def list_dockets(
+    status: Optional[str] = None,
+    sector: Optional[str] = None,
+    year: Optional[int] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    db: Session = Depends(get_db)
+):
+    """List dockets with filtering and pagination."""
+    query = db.query(FLDocket)
+
+    if status:
+        query = query.filter(FLDocket.status == status)
+    if sector:
+        query = query.filter(FLDocket.sector_code == sector)
+    if year:
+        query = query.filter(FLDocket.year == year)
+    if search:
+        query = query.filter(
+            (FLDocket.docket_number.ilike(f"%{search}%")) |
+            (FLDocket.title.ilike(f"%{search}%")) |
+            (FLDocket.utility_name.ilike(f"%{search}%"))
+        )
+
+    total = query.count()
+    dockets = query.order_by(FLDocket.filed_date.desc().nullslast()).offset(
+        (page - 1) * page_size
+    ).limit(page_size).all()
+
+    return {
+        "items": [
+            {
+                "id": d.id,
+                "docket_number": d.docket_number,
+                "title": d.title,
+                "utility_name": d.utility_name,
+                "status": d.status,
+                "case_type": d.case_type,
+                "sector_code": d.sector_code,
+                "industry_type": d.industry_type,
+                "filed_date": d.filed_date.isoformat() if d.filed_date else None,
+                "psc_url": d.psc_url
+            }
+            for d in dockets
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size
+    }
+
+
+# ============================================================================
+# THUNDERSTONE DOCUMENT SEARCH
+# ============================================================================
+
+@router.get("/thunderstone/profiles")
+def get_thunderstone_profiles():
+    """Get available Thunderstone search profiles."""
+    from florida.scrapers.thunderstone import FloridaThunderstoneScraper
+
+    try:
+        scraper = FloridaThunderstoneScraper()
+        profiles = scraper.get_profiles()
+        return {
+            "profiles": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "document_count": p.document_count
+                }
+                for p in profiles
+            ]
+        }
+    except Exception as e:
+        return {"profiles": [], "error": str(e)}
+
+
+@router.get("/thunderstone/search")
+def thunderstone_search(
+    query: str,
+    profile: str = "library",
+    docket_number: Optional[str] = None,
+    limit: int = 50
+):
+    """
+    Search Florida PSC documents via Thunderstone.
+
+    Args:
+        query: Search query text
+        profile: Search profile (library, orders, filingsCurrent, etc.)
+        docket_number: Optional docket number filter
+        limit: Maximum results
+    """
+    from florida.scrapers.thunderstone import FloridaThunderstoneScraper
+
+    try:
+        scraper = FloridaThunderstoneScraper()
+        documents = list(scraper.search(
+            query=query,
+            profile=profile,
+            docket_number=docket_number,
+            limit=limit
+        ))
+
+        return {
+            "query": query,
+            "profile": profile,
+            "total": len(documents),
+            "documents": [
+                {
+                    "id": doc.thunderstone_id,
+                    "title": doc.title,
+                    "document_type": doc.document_type,
+                    "docket_number": doc.docket_number,
+                    "file_url": doc.file_url,
+                    "file_type": doc.file_type,
+                    "filed_date": doc.filed_date.isoformat() if doc.filed_date else None,
+                    "filer_name": doc.filer_name,
+                    "excerpt": doc.content_excerpt[:300] if doc.content_excerpt else None
+                }
+                for doc in documents
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Thunderstone search failed: {str(e)}")
 
 
 @router.get("/pipeline/hearings/{hearing_id}/details")
@@ -993,55 +1748,141 @@ def get_hearing_details(hearing_id: int, db: Session = Depends(get_db)):
 
 
 # ============================================================================
-# REVIEW ENDPOINTS (Stub for entity review workflow)
+# ENTITY LINKING
 # ============================================================================
 
-@router.get("/review/stats")
-def get_review_stats(db: Session = Depends(get_db)):
-    """Get review queue statistics."""
-    # For now, return zeros since we don't have the entity review workflow
-    return {
-        "total": 0,
-        "dockets": 0,
-        "topics": 0,
-        "utilities": 0,
-        "hearings": 0
-    }
+class EntityLinkingRequest(BaseModel):
+    hearing_ids: Optional[List[int]] = None
+    limit: int = 50
 
 
-@router.get("/review/queue")
-def get_review_queue(
-    entity_type: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0
-):
-    """Get items needing review (stub)."""
-    return {"items": [], "total": 0}
-
-
-@router.get("/review/hearings")
-def get_review_hearings(
-    limit: int = 20,
-    offset: int = 0,
+@router.post("/pipeline/entity-linking/run")
+def run_entity_linking(
+    request: EntityLinkingRequest,
     db: Session = Depends(get_db)
 ):
-    """Get hearings with entities needing review (stub)."""
-    return {"items": [], "total": 0}
+    """
+    Run entity linking on analyzed hearings.
+
+    This extracts docket numbers, utilities, and topics from transcripts
+    and links them to canonical records using fuzzy matching.
+    """
+    from florida.services.entity_linking import FloridaEntityLinker
+
+    linker = FloridaEntityLinker(db)
+
+    if request.hearing_ids:
+        # Process specific hearings
+        results = []
+        for hearing_id in request.hearing_ids:
+            try:
+                result = linker.link_hearing(hearing_id, skip_existing=False)
+                results.append({
+                    "hearing_id": hearing_id,
+                    "dockets": len(result.dockets),
+                    "utilities": len(result.utilities),
+                    "topics": len(result.topics),
+                    "needs_review": result.needs_review_count,
+                    "errors": result.errors
+                })
+            except Exception as e:
+                results.append({
+                    "hearing_id": hearing_id,
+                    "error": str(e)
+                })
+
+        return {
+            "status": "completed",
+            "hearings": results,
+            "total_processed": len(results)
+        }
+    else:
+        # Process all analyzed hearings
+        stats = linker.link_all_hearings(
+            status="analyzed",
+            limit=request.limit
+        )
+
+        return {
+            "status": "completed",
+            "hearings_processed": stats['total_processed'],
+            "total_dockets": stats['total_dockets'],
+            "total_utilities": stats['total_utilities'],
+            "total_topics": stats['total_topics'],
+            "needs_review": stats['needs_review'],
+            "errors": stats['errors'][:10]  # Limit error list
+        }
 
 
-@router.post("/review/hearings/{hearing_id}/bulk")
-def bulk_review_hearing(hearing_id: int, db: Session = Depends(get_db)):
-    """Bulk approve/reject entities for a hearing (stub)."""
-    return {"message": "Review not implemented", "hearing_id": hearing_id}
+@router.get("/pipeline/entity-linking/stats")
+def get_entity_linking_stats(db: Session = Depends(get_db)):
+    """Get entity linking statistics."""
+    from florida.models.linking import (
+        FLHearingDocket, FLHearingUtility, FLHearingTopic,
+        FLUtility, FLTopic
+    )
 
+    # Count linked hearings
+    hearings_with_dockets = db.query(func.count(func.distinct(FLHearingDocket.hearing_id))).scalar() or 0
+    hearings_with_utilities = db.query(func.count(func.distinct(FLHearingUtility.hearing_id))).scalar() or 0
+    hearings_with_topics = db.query(func.count(func.distinct(FLHearingTopic.hearing_id))).scalar() or 0
 
-@router.post("/review/{entity_type}/{entity_id}")
-def review_entity(entity_type: str, entity_id: int):
-    """Review a specific entity (stub)."""
-    return {"message": "Review not implemented", "entity_type": entity_type, "entity_id": entity_id}
+    # Count total links
+    total_docket_links = db.query(func.count(FLHearingDocket.id)).scalar() or 0
+    total_utility_links = db.query(func.count(FLHearingUtility.id)).scalar() or 0
+    total_topic_links = db.query(func.count(FLHearingTopic.id)).scalar() or 0
 
+    # Count items needing review
+    dockets_review = db.query(func.count(FLHearingDocket.id)).filter(
+        FLHearingDocket.needs_review == True
+    ).scalar() or 0
+    utilities_review = db.query(func.count(FLHearingUtility.id)).filter(
+        FLHearingUtility.needs_review == True
+    ).scalar() or 0
+    topics_review = db.query(func.count(FLHearingTopic.id)).filter(
+        FLHearingTopic.needs_review == True
+    ).scalar() or 0
 
-@router.post("/review/hearing_docket/{hearing_id}/{docket_id}")
-def link_hearing_docket(hearing_id: int, docket_id: int):
-    """Link a hearing to a docket (stub)."""
-    return {"message": "Not implemented", "hearing_id": hearing_id, "docket_id": docket_id}
+    # Count canonical entities
+    total_utilities = db.query(func.count(FLUtility.id)).scalar() or 0
+    total_topics = db.query(func.count(FLTopic.id)).scalar() or 0
+    total_dockets = db.query(func.count(FLDocket.id)).scalar() or 0
+
+    # Count analyzed hearings (those with analysis records)
+    from florida.models.analysis import FLAnalysis
+    analyzed_count = db.query(func.count(func.distinct(FLAnalysis.hearing_id))).scalar() or 0
+
+    unlinked_count = db.execute(text("""
+        SELECT COUNT(DISTINCT h.id)
+        FROM fl_hearings h
+        JOIN fl_analyses a ON a.hearing_id = h.id
+        WHERE NOT EXISTS (SELECT 1 FROM fl_hearing_dockets hd WHERE hd.hearing_id = h.id)
+          AND NOT EXISTS (SELECT 1 FROM fl_hearing_utilities hu WHERE hu.hearing_id = h.id)
+          AND NOT EXISTS (SELECT 1 FROM fl_hearing_topics ht WHERE ht.hearing_id = h.id)
+    """)).scalar() or 0
+
+    return {
+        "hearings": {
+            "analyzed": analyzed_count,
+            "with_dockets": hearings_with_dockets,
+            "with_utilities": hearings_with_utilities,
+            "with_topics": hearings_with_topics,
+            "unlinked": unlinked_count
+        },
+        "links": {
+            "dockets": total_docket_links,
+            "utilities": total_utility_links,
+            "topics": total_topic_links
+        },
+        "needs_review": {
+            "dockets": dockets_review,
+            "utilities": utilities_review,
+            "topics": topics_review,
+            "total": dockets_review + utilities_review + topics_review
+        },
+        "canonical_entities": {
+            "dockets": total_dockets,
+            "utilities": total_utilities,
+            "topics": total_topics
+        }
+    }

@@ -27,6 +27,9 @@ from enum import Enum
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from app.database import SessionLocal
 from app.models.database import Source, Hearing, State
 
@@ -379,6 +382,11 @@ class ScraperOrchestrator:
             videos = scraper.fetch_videos(max_videos=1500)
             results["items_found"] = len(videos)
 
+            # Fetch dates from YouTube API for videos missing them
+            videos_missing_dates = [v for v in videos if v.upload_date is None]
+            if videos_missing_dates:
+                self._fetch_youtube_dates(videos, videos_missing_dates)
+
             # Filter for hearing content
             videos = [v for v in videos if is_hearing_video(v)]
 
@@ -491,6 +499,31 @@ class ScraperOrchestrator:
             self._mark_source_error(db, source, str(e), dry_run)
 
         return results
+
+    def _fetch_youtube_dates(self, all_videos: list, videos_missing_dates: list):
+        """Fetch dates from YouTube API for videos missing them."""
+        try:
+            from scripts.scrapers.youtube_api import YouTubeAPI
+            api = YouTubeAPI()
+
+            # Build lookup by video_id
+            video_map = {v.video_id: v for v in videos_missing_dates}
+            video_ids = list(video_map.keys())
+
+            logger.info(f"Fetching dates for {len(video_ids)} videos from YouTube API...")
+            results = api.get_video_details_batch(video_ids)
+
+            # Update video objects with dates
+            updated = 0
+            for video_id, metadata in results.items():
+                if metadata.published_at and video_id in video_map:
+                    video_map[video_id].upload_date = metadata.published_at
+                    updated += 1
+
+            logger.info(f"Updated {updated} videos with dates from API")
+
+        except Exception as e:
+            logger.warning(f"Could not fetch dates from YouTube API: {e}")
 
     def _infer_youtube_hearing_type(self, title: str) -> str:
         """Infer hearing type from YouTube video title."""

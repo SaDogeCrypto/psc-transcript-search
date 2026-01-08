@@ -37,26 +37,26 @@ export default function DashboardLayout({
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
 
-  const isAdmin = (session?.user as any)?.role === 'admin'
+  // Auth disabled for demo - treat everyone as admin
+  const isAdmin = true
 
   const handleSignOut = async () => {
     await signOut({ callbackUrl: '/login' })
   }
 
-  // Show loading state
-  if (status === 'loading') {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="animate-spin h-8 w-8 border-4 border-blue-600 border-t-transparent rounded-full" />
-      </div>
-    )
-  }
+  // Auth disabled for demo sharing
+  // if (status === 'loading') {
+  //   return (
+  //     <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+  //       <div className="animate-spin h-8 w-8 border-4 border-blue-600 border-t-transparent rounded-full" />
+  //     </div>
+  //   )
+  // }
 
-  // Redirect if not authenticated
-  if (status === 'unauthenticated') {
-    router.push('/login')
-    return null
-  }
+  // if (status === 'unauthenticated') {
+  //   router.push('/login')
+  //   return null
+  // }
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -132,10 +132,10 @@ export default function DashboardLayout({
             </div>
             <div className="flex-1 min-w-0">
               <div className="text-sm font-medium text-gray-900 truncate">
-                {session?.user?.name || 'User'}
+                {session?.user?.name || 'Demo User'}
               </div>
               <div className="text-xs text-gray-500 truncate">
-                {session?.user?.email || ''}
+                {session?.user?.email || 'demo@canaryscope.com'}
               </div>
             </div>
           </div>

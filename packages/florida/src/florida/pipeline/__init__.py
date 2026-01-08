@@ -4,8 +4,8 @@ Florida PSC pipeline stages.
 Pipeline stages for Florida-specific processing:
 - DocketSyncStage: Sync dockets from ClerkOffice API
 - DocumentSyncStage: Index documents from Thunderstone
-- HearingDiscoveryStage: Find YouTube hearings (future)
-- TranscriptProcessStage: Whisper transcription (future)
+- FLTranscribeStage: Whisper transcription for FL hearings
+- FLAnalyzeStage: LLM analysis for FL hearings
 """
 
 from florida.pipeline.docket_sync import DocketSyncStage, DocketSyncResult
@@ -15,6 +15,7 @@ from florida.pipeline.orchestrator import (
     PipelineRun,
     PipelineStage,
 )
+from florida.pipeline.stages import FLTranscribeStage, FLAnalyzeStage
 
 __all__ = [
     # Stages
@@ -22,6 +23,9 @@ __all__ = [
     'DocketSyncResult',
     'DocumentSyncStage',
     'DocumentSyncResult',
+    # Transcript/Analysis Stages
+    'FLTranscribeStage',
+    'FLAnalyzeStage',
     # Orchestrator
     'FloridaPipelineOrchestrator',
     'PipelineRun',

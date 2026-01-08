@@ -1,12 +1,11 @@
 /**
- * API client for the PSC Transcript Search backend
+ * API client for PSC Hearing Intelligence Admin Backend
  */
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export interface AdminStats {
   total_states: number;
-  total_sources: number;
   total_hearings: number;
   total_segments: number;
   total_hours: number;
@@ -17,90 +16,88 @@ export interface AdminStats {
   total_cost: number;
   hearings_last_24h: number;
   hearings_last_7d: number;
-  sources_healthy: number;
-  sources_error: number;
-  pipeline_jobs_pending: number;
-  pipeline_jobs_running: number;
-  pipeline_jobs_error: number;
-  cost_today: number;
-  cost_this_week: number;
-  cost_this_month: number;
-}
-
-export interface Source {
-  id: number;
-  state_id: number;
-  state_code: string;
-  state_name: string;
-  name: string;
-  source_type: string;
-  url: string;
-  enabled: boolean;
-  check_frequency_hours: number;
-  last_checked_at: string | null;
-  last_hearing_at: string | null;
-  status: string;
-  error_message: string | null;
-  created_at: string;
 }
 
 export interface State {
-  id: number;
   code: string;
   name: string;
   commission_name: string | null;
   hearing_count: number;
+  docket_format?: string | null;
 }
 
-export interface SourceCreateData {
-  state_id: number;
+export interface Scraper {
   name: string;
-  source_type: string;
-  url: string;
-  check_frequency_hours?: number;
-  enabled?: boolean;
+  state_code: string;
+  description?: string;
 }
 
-export interface PipelineJob {
-  id: number;
-  hearing_id: number;
-  stage: string;
-  status: string;
-  started_at: string | null;
-  completed_at: string | null;
-  error_message: string | null;
-  retry_count: number;
-  cost_usd: number | null;
+export interface ScraperStatus {
+  state_code: string;
+  scraper: string;
+  status: 'idle' | 'running' | 'completed' | 'error';
+  last_run?: string;
+  items_found?: number;
+  errors?: string[];
 }
 
 export interface Hearing {
-  id: number;
+  id: string;
   state_code: string;
-  state_name: string;
-  title: string;
+  title: string | null;
   hearing_date: string | null;
   hearing_type: string | null;
-  utility_name: string | null;
+  docket_number: string | null;
   duration_seconds: number | null;
-  status: string;
-  source_url: string | null;
-  created_at: string;
-  pipeline_status: string;
-  pipeline_jobs: PipelineJob[];
+  transcript_status: string | null;
+  video_url: string | null;
+  one_sentence_summary?: string | null;
+  utility_name?: string | null;
+  sector?: string | null;
 }
 
-export interface PipelineRun {
-  id: number;
-  started_at: string;
-  completed_at: string | null;
+export interface PaginatedResponse<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface PipelineRunRequest {
+  stage: string;
+  state_code?: string;
+  hearing_ids?: string[];
+  limit?: number;
+}
+
+export interface PipelineStatus {
   status: string;
-  sources_checked: number;
-  new_hearings: number;
-  hearings_processed: number;
-  errors: number;
-  transcription_cost_usd: number;
-  analysis_cost_usd: number;
-  total_cost_usd: number;
+  stage: string;
+  total: number;
+  successful?: number;
+  failed?: number;
+  skipped?: number;
+  total_cost_usd?: number;
+  errors?: Array<{ error: string }>;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface PendingHearing {
+  id: string;
+  title: string | null;
+  docket_number: string | null;
+  hearing_date: string | null;
+  transcript_status: string | null;
+}
+
+export interface ScraperRunResult {
+  state_code: string;
+  scraper: string;
+  status: string;
+  items_found?: number;
+  hearings_created?: number;
+  errors?: string[];
 }
 
 async function fetchAPI<T>(endpoint: string, options?: RequestInit): Promise<T> {
@@ -108,6 +105,7 @@ async function fetchAPI<T>(endpoint: string, options?: RequestInit): Promise<T> 
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      'X-API-Key': process.env.NEXT_PUBLIC_ADMIN_API_KEY || 'admin-dev-key',
       ...options?.headers,
     },
   });
@@ -129,119 +127,130 @@ export async function getStates(): Promise<State[]> {
   return fetchAPI<State[]>('/admin/states');
 }
 
-// Sources
-export async function getSources(state?: string, status?: string): Promise<Source[]> {
-  const params = new URLSearchParams();
-  if (state) params.set('state', state);
-  if (status) params.set('status', status);
-  const query = params.toString() ? `?${params.toString()}` : '';
-  return fetchAPI<Source[]>(`/admin/sources${query}`);
+// Scrapers
+export async function getScrapers(): Promise<Record<string, string[]>> {
+  return fetchAPI<Record<string, string[]>>('/admin/scrapers');
 }
 
-export async function createSource(data: SourceCreateData): Promise<Source> {
-  return fetchAPI<Source>('/admin/sources', {
+export async function getScraperStates(): Promise<string[]> {
+  return fetchAPI<string[]>('/admin/scrapers/states');
+}
+
+export async function getScraperStatus(stateCode: string, scraper: string): Promise<ScraperStatus> {
+  return fetchAPI<ScraperStatus>(`/admin/scrapers/status/${stateCode}/${scraper}`);
+}
+
+export async function runScraper(stateCode: string, scraper: string, daysBack?: number): Promise<ScraperRunResult> {
+  const params = new URLSearchParams();
+  params.set('state_code', stateCode);
+  params.set('scraper', scraper);
+  if (daysBack) params.set('days_back', daysBack.toString());
+
+  return fetchAPI<ScraperRunResult>(`/admin/scrapers/run?${params.toString()}`, {
     method: 'POST',
-    body: JSON.stringify(data),
   });
 }
 
-export async function deleteSource(sourceId: number): Promise<{ message: string }> {
-  return fetchAPI(`/admin/sources/${sourceId}`, { method: 'DELETE' });
+export async function runScraperAsync(stateCode: string, scraper: string, daysBack?: number): Promise<{ message: string; status: string }> {
+  const params = new URLSearchParams();
+  params.set('state_code', stateCode);
+  params.set('scraper', scraper);
+  if (daysBack) params.set('days_back', daysBack.toString());
+
+  return fetchAPI(`/admin/scrapers/run-async?${params.toString()}`, {
+    method: 'POST',
+  });
 }
 
-export async function triggerSourceCheck(sourceId: number): Promise<{ message: string }> {
-  return fetchAPI(`/admin/sources/${sourceId}/check`, { method: 'POST' });
-}
-
-export async function toggleSource(sourceId: number): Promise<{ message: string; enabled: boolean }> {
-  return fetchAPI(`/admin/sources/${sourceId}/toggle`, { method: 'PATCH' });
+export async function getScraperStats(): Promise<{
+  scrapers_by_state: Record<string, string[]>;
+  total_scrapers: number;
+}> {
+  return fetchAPI('/admin/scrapers/stats');
 }
 
 // Hearings
 export async function getHearings(params?: {
-  states?: string;
+  state_code?: string;
   status?: string;
-  pipeline_status?: string;
-  date_from?: string;
-  date_to?: string;
-  page?: number;
-  page_size?: number;
-}): Promise<Hearing[]> {
+  docket_number?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<PaginatedResponse<Hearing>> {
   const searchParams = new URLSearchParams();
-  if (params?.states) searchParams.set('states', params.states);
+  if (params?.state_code) searchParams.set('state_code', params.state_code);
   if (params?.status) searchParams.set('status', params.status);
-  if (params?.pipeline_status) searchParams.set('pipeline_status', params.pipeline_status);
-  if (params?.date_from) searchParams.set('date_from', params.date_from);
-  if (params?.date_to) searchParams.set('date_to', params.date_to);
-  if (params?.page) searchParams.set('page', params.page.toString());
-  if (params?.page_size) searchParams.set('page_size', params.page_size.toString());
+  if (params?.docket_number) searchParams.set('docket_number', params.docket_number);
+  if (params?.limit) searchParams.set('limit', params.limit.toString());
+  if (params?.offset) searchParams.set('offset', params.offset.toString());
+
   const query = searchParams.toString() ? `?${searchParams.toString()}` : '';
-  return fetchAPI<Hearing[]>(`/admin/hearings${query}`);
+  return fetchAPI<PaginatedResponse<Hearing>>(`/api/hearings${query}`);
 }
 
-export async function retryHearing(hearingId: number, stage?: string): Promise<{ message: string }> {
-  const params = stage ? `?stage=${stage}` : '';
-  return fetchAPI(`/admin/hearings/${hearingId}/retry${params}`, { method: 'POST' });
+// Pipeline
+export async function runPipeline(request: PipelineRunRequest): Promise<PipelineStatus> {
+  return fetchAPI<PipelineStatus>('/admin/pipeline/run', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
 }
 
-export async function cancelHearing(hearingId: number): Promise<{ message: string }> {
-  return fetchAPI(`/admin/hearings/${hearingId}/cancel`, { method: 'POST' });
+export async function runPipelineSync(request: PipelineRunRequest): Promise<PipelineStatus> {
+  return fetchAPI<PipelineStatus>('/admin/pipeline/run-sync', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
 }
 
-// Pipeline Runs
-export async function getPipelineRuns(limit: number = 30): Promise<PipelineRun[]> {
-  return fetchAPI<PipelineRun[]>(`/admin/runs?limit=${limit}`);
+export async function runPipelineSingle(hearingId: string, stage: string): Promise<{
+  hearing_id: string;
+  success: boolean;
+  skipped: boolean;
+  error?: string;
+  cost_usd?: number;
+}> {
+  return fetchAPI(`/admin/pipeline/run-single/${hearingId}?stage=${stage}`, {
+    method: 'POST',
+  });
 }
 
-// Scraper Control
-export interface ScraperError {
-  timestamp: string;
-  source: string;
-  error: string;
+export async function getPendingHearings(stage: string, stateCode?: string, limit?: number): Promise<{
+  stage: string;
+  state_code: string | null;
+  count: number;
+  hearings: PendingHearing[];
+}> {
+  const params = new URLSearchParams();
+  params.set('stage', stage);
+  if (stateCode) params.set('state_code', stateCode);
+  if (limit) params.set('limit', limit.toString());
+
+  return fetchAPI(`/admin/pipeline/pending?${params.toString()}`);
 }
 
-export interface ScraperResults {
-  sources_scraped: number;
-  items_found: number;
-  new_hearings: number;
-  existing_hearings: number;
-  errors: number;
+export async function getPipelineStatus(runId: string): Promise<PipelineStatus> {
+  return fetchAPI<PipelineStatus>(`/admin/pipeline/status/${runId}`);
 }
 
-export interface ScraperProgress {
-  status: 'idle' | 'running' | 'stopping' | 'completed' | 'error';
-  started_at: string | null;
-  finished_at: string | null;
-  current_scraper_type: string | null;
-  current_source_name: string | null;
-  current_source_index: number;
-  total_sources: number;
-  sources_completed: number;
-  items_found: number;
-  new_hearings: number;
-  existing_hearings: number;
-  errors: ScraperError[];
-  error_count: number;
-  scraper_results: Record<string, ScraperResults>;
+export async function getPipelineStats(stateCode?: string): Promise<{
+  status_counts: Record<string, number>;
+  total_hearings: number;
+  total_processing_cost_usd: number;
+}> {
+  const query = stateCode ? `?state_code=${stateCode}` : '';
+  return fetchAPI(`/admin/pipeline/stats${query}`);
 }
 
-export async function getScraperStatus(): Promise<ScraperProgress> {
-  return fetchAPI<ScraperProgress>('/admin/scraper/status');
+// Health check
+export async function healthCheck(): Promise<{ status: string }> {
+  return fetchAPI('/health');
 }
 
-export async function startScraper(params?: {
-  scraper_types?: string;
-  state?: string;
-  dry_run?: boolean;
-}): Promise<{ message: string; status: string }> {
-  const searchParams = new URLSearchParams();
-  if (params?.scraper_types) searchParams.set('scraper_types', params.scraper_types);
-  if (params?.state) searchParams.set('state', params.state);
-  if (params?.dry_run) searchParams.set('dry_run', 'true');
-  const query = searchParams.toString() ? `?${searchParams.toString()}` : '';
-  return fetchAPI(`/admin/scraper/start${query}`, { method: 'POST' });
-}
-
-export async function stopScraper(): Promise<{ message: string; status: string }> {
-  return fetchAPI('/admin/scraper/stop', { method: 'POST' });
+export async function getDetailedHealth(): Promise<{
+  database: string;
+  whisper_provider: string;
+  registered_states: string[];
+}> {
+  return fetchAPI('/health/detailed');
 }
