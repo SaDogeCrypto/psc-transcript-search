@@ -227,6 +227,15 @@ interface DataQuality {
 }
 
 // Review types
+interface ReviewSuggestion {
+  id: number;
+  normalized_id?: string;
+  name?: string;
+  title?: string;
+  utility_name?: string;
+  score: number;
+}
+
 interface EntityReviewItem {
   id: number;
   entity_type: string;
@@ -243,6 +252,7 @@ interface EntityReviewItem {
   known_utility?: string;
   known_title?: string;
   utility_match?: boolean;
+  suggestions?: ReviewSuggestion[];
 }
 
 interface HearingReviewItem {
@@ -671,8 +681,15 @@ export default function PipelinePage() {
   const loadStageHearings = async (pendingStatus: string, stateFilter?: string) => {
     setStageHearingsLoading(true);
     try {
+      // Map dashboard status names to Florida API status names
+      const statusMap: Record<string, string> = {
+        'downloaded': 'pending',      // Transcribe stage: downloaded → pending (need transcription)
+        'complete': 'analyzed',       // Complete stage: complete → analyzed
+      };
+      const apiStatus = statusMap[pendingStatus] || pendingStatus;
+
       const params = new URLSearchParams({
-        status: pendingStatus,
+        status: apiStatus,
         page_size: '500',
       });
       if (stateFilter) {
@@ -868,7 +885,7 @@ export default function PipelinePage() {
     setStageStateFilter(stateCode);
     setSelectedHearings(new Set());
     if (expandedStage === 'complete') {
-      loadStageHearings('complete', stateCode);
+      loadStageHearings('analyzed', stateCode);  // Florida API uses 'analyzed'
     } else if (expandedStage === 'skipped') {
       loadStageHearings('skipped', stateCode);
     } else {
@@ -1149,11 +1166,17 @@ export default function PipelinePage() {
     if (pendingStatus === 'review') {
       return reviewStats?.hearings || 0;
     }
+    // Map Florida API's simpler status keys to expected stage keys
+    // Florida returns: pending (need transcription), transcribed (need analysis), analyzed (complete)
+    if (pendingStatus === 'downloaded') {
+      return status?.stage_counts?.['pending'] || status?.stage_counts?.['downloaded'] || 0;
+    }
     return status?.stage_counts?.[pendingStatus] || 0;
   };
 
   const getCompleteCount = () => {
-    return status?.stage_counts?.['complete'] || 0;
+    // Florida API uses 'analyzed' for complete hearings
+    return status?.stage_counts?.['complete'] || status?.stage_counts?.['analyzed'] || 0;
   };
 
   const getSkippedCount = () => {
@@ -1564,7 +1587,7 @@ export default function PipelinePage() {
                   setStageHearings([]);
                 } else {
                   setExpandedStage('complete');
-                  loadStageHearings('complete');
+                  loadStageHearings('analyzed');  // Florida API uses 'analyzed' for complete
                 }
               }
             }}
