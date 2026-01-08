@@ -10,10 +10,9 @@ from decimal import Decimal
 from sqlalchemy import (
     Column, Integer, String, Text, DateTime, Float, Numeric, ForeignKey
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
-from florida.models.base import Base
+from florida.models.base import Base, JSONB
 
 if TYPE_CHECKING:
     from florida.models.hearing import FLHearing

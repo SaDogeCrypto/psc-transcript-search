@@ -9,10 +9,9 @@ from typing import Optional, TYPE_CHECKING
 from sqlalchemy import (
     Column, Integer, String, Text, DateTime, Float, ForeignKey
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
-from florida.models.base import Base
+from florida.models.base import Base, JSONB
 
 if TYPE_CHECKING:
     from florida.models.hearing import FLHearing, FLTranscriptSegment

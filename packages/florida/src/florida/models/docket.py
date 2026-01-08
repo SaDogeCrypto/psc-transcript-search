@@ -11,10 +11,9 @@ from sqlalchemy import (
     Column, Integer, String, Text, Date, DateTime,
     Numeric, ForeignKey
 )
-from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
-from florida.models.base import Base
+from florida.models.base import Base, JSONB, ARRAY
 
 if TYPE_CHECKING:
     from florida.models.document import FLDocument

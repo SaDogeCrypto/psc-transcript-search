@@ -14,10 +14,7 @@ RUN apt-get update && apt-get install -y \
 COPY packages/florida/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy core package (dependency)
-COPY packages/core/src/core ./src/core/
-
-# Copy Florida application code
+# Copy Florida application code (self-contained, no core dependency)
 COPY packages/florida/src/ ./src/
 
 # Set Python path
