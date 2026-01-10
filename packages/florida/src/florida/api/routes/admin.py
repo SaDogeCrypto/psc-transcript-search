@@ -14,6 +14,7 @@ from florida.models import get_db
 from florida.models.hearing import FLHearing, FLTranscriptSegment
 from florida.models.analysis import FLAnalysis
 from florida.models.docket import FLDocket
+from florida.models.linking import FLHearingDocket
 from florida.scraper import (
     get_scraper_status as _get_scraper_status,
     start_scraper_async,
@@ -47,6 +48,7 @@ class AdminStatsResponse(BaseModel):
     total_transcription_cost: float
     total_analysis_cost: float
     total_cost: float
+    cost_by_model: dict  # Breakdown of costs by LLM model
     hearings_last_24h: int
     hearings_last_7d: int
 
@@ -233,6 +235,29 @@ def get_admin_stats(db: Session = Depends(get_db)):
     total_analysis_cost = db.query(func.sum(FLAnalysis.cost_usd)).scalar() or 0
     total_transcription_cost = db.query(func.sum(FLHearing.processing_cost_usd)).scalar() or 0
 
+    # Cost breakdown by model
+    cost_by_model = {}
+
+    # Analysis costs - first try FLAnalysis table which has model info
+    analysis_by_model = db.query(
+        func.coalesce(FLAnalysis.model, 'gpt-4o-mini'),
+        func.sum(FLAnalysis.cost_usd)
+    ).filter(FLAnalysis.cost_usd.isnot(None)).group_by(func.coalesce(FLAnalysis.model, 'gpt-4o-mini')).all()
+
+    for model_name, cost in analysis_by_model:
+        if model_name and cost:
+            cost_by_model[model_name] = float(cost or 0)
+
+    # Transcription costs by whisper model
+    transcription_by_model = db.query(
+        func.coalesce(FLHearing.whisper_model, 'whisper-large-v3-turbo'),
+        func.sum(FLHearing.processing_cost_usd)
+    ).filter(FLHearing.processing_cost_usd.isnot(None)).group_by(func.coalesce(FLHearing.whisper_model, 'whisper-large-v3-turbo')).all()
+
+    for model_name, cost in transcription_by_model:
+        if model_name and cost:
+            cost_by_model[model_name] = cost_by_model.get(model_name, 0) + float(cost or 0)
+
     # Recent activity
     hearings_24h = db.query(func.count(FLHearing.id)).filter(
         FLHearing.created_at >= now - timedelta(hours=24)
@@ -280,6 +305,7 @@ def get_admin_stats(db: Session = Depends(get_db)):
         total_transcription_cost=float(total_transcription_cost),
         total_analysis_cost=float(total_analysis_cost),
         total_cost=float(total_transcription_cost) + float(total_analysis_cost),
+        cost_by_model=cost_by_model,
         hearings_last_24h=hearings_24h,
         hearings_last_7d=hearings_7d,
         sources_healthy=1,
@@ -1884,5 +1910,523 @@ def get_entity_linking_stats(db: Session = Depends(get_db)):
             "dockets": total_dockets,
             "utilities": total_utilities,
             "topics": total_topics
+        }
+    }
+
+
+# ============================================================================
+# CASES (Sales Dashboard)
+# ============================================================================
+
+class CaseListItem(BaseModel):
+    docket_number: str
+    title: Optional[str] = None
+    utility: Optional[str] = None
+    filed_date: Optional[str] = None
+    status: Optional[str] = None
+    case_type: Optional[str] = None
+    sector: Optional[str] = None
+    document_count: int = 0
+    hearing_count: int = 0
+    event_count: int = 0
+    has_selling_windows: bool = False
+
+
+class CaseListResponse(BaseModel):
+    total: int
+    items: list
+    limit: int
+    offset: int
+
+
+@router.get("/cases", response_model=CaseListResponse)
+def list_cases(
+    state: str = "FL",
+    status: Optional[str] = Query(None, description="Filter by status: 'open' or 'closed'"),
+    utility: Optional[str] = Query(None, description="Filter by utility name (partial match)"),
+    case_type: Optional[str] = Query(None, description="Filter by docket suffix: EI, GU, etc."),
+    year: Optional[int] = Query(None, description="Filter by filing year"),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db)
+):
+    """
+    List cases with basic info.
+
+    Pulls from fl_dockets, enriches with counts from fl_documents, fl_hearings, fl_case_events.
+    This is the main endpoint for the Cases page in the sales dashboard.
+    """
+    from florida.models.document import FLDocument
+    from florida.models.sales import FLCaseEvent, FLSellingWindow
+
+    query = db.query(FLDocket)
+
+    # Exclude junk records created from order numbers
+    # - Records with title that looks like an order (PSC-YYYY-NNNN-* or ORDER*)
+    # - Records with docket_number that doesn't match proper format (YYYYNNNN-XX)
+    from sqlalchemy import or_, and_
+    query = query.filter(
+        or_(
+            FLDocket.title.is_(None),
+            and_(
+                ~FLDocket.title.like('PSC-%'),
+                ~FLDocket.title.like('ORDER%')
+            )
+        ),
+        # Proper docket format: 8 digits, hyphen, 2 letter sector code (PostgreSQL regex)
+        FLDocket.docket_number.op('~')(r'^[0-9]{8}-[A-Z]{2}$')
+    )
+
+    # Status filter
+    if status == 'open':
+        query = query.filter(
+            (FLDocket.status == 'open') |
+            (FLDocket.status == 'Open') |
+            (FLDocket.closed_date.is_(None))
+        )
+    elif status == 'closed':
+        query = query.filter(
+            (FLDocket.status == 'closed') |
+            (FLDocket.status == 'Closed') |
+            (FLDocket.closed_date.isnot(None))
+        )
+
+    # Utility filter (partial match)
+    if utility:
+        query = query.filter(FLDocket.utility_name.ilike(f'%{utility}%'))
+
+    # Case type filter (sector code suffix like EI, GU)
+    if case_type:
+        query = query.filter(FLDocket.docket_number.like(f'%-{case_type}'))
+
+    # Year filter
+    if year:
+        query = query.filter(FLDocket.year == year)
+
+    # Get total count before pagination
+    total = query.count()
+
+    # Order by filed_date descending (most recent first)
+    dockets = query.order_by(
+        FLDocket.filed_date.desc().nullslast()
+    ).offset(offset).limit(limit).all()
+
+    # Enrich with counts
+    results = []
+    for d in dockets:
+        # Document count
+        doc_count = db.query(func.count(FLDocument.id)).filter(
+            FLDocument.docket_number == d.docket_number
+        ).scalar() or 0
+
+        # Hearing count (via hearing_docket junction table)
+        hearing_count = db.query(func.count(FLHearingDocket.id)).filter(
+            FLHearingDocket.docket_id == d.id
+        ).scalar() or 0
+
+        # Event count
+        event_count = db.query(func.count(FLCaseEvent.id)).filter(
+            FLCaseEvent.docket_number == d.docket_number
+        ).scalar() or 0
+
+        # Check for active selling windows
+        has_windows = db.query(FLSellingWindow.id).filter(
+            FLSellingWindow.docket_number == d.docket_number,
+            FLSellingWindow.is_active == True
+        ).first() is not None
+
+        results.append({
+            "docket_number": d.docket_number,
+            "title": d.title,
+            "utility": d.utility_name,
+            "filed_date": d.filed_date.isoformat() if d.filed_date else None,
+            "status": d.status,
+            "case_type": d.case_type,
+            "sector": d.sector_code,
+            "document_count": doc_count,
+            "hearing_count": hearing_count,
+            "event_count": event_count,
+            "has_selling_windows": has_windows,
+        })
+
+    return CaseListResponse(
+        total=total,
+        items=results,
+        limit=limit,
+        offset=offset
+    )
+
+
+@router.get("/cases/{docket_number}")
+def get_case_detail(
+    docket_number: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get detailed case information including timeline, documents, hearings.
+    """
+    from florida.models.document import FLDocument
+    from florida.models.sales import FLCaseEvent, FLSellingWindow
+    from florida.models.regulatory_decision import FLRegulatoryDecision
+
+    # Get docket
+    docket = db.query(FLDocket).filter(
+        FLDocket.docket_number == docket_number
+    ).first()
+
+    if not docket:
+        raise HTTPException(status_code=404, detail=f"Docket {docket_number} not found")
+
+    # Get documents
+    documents = db.query(FLDocument).filter(
+        FLDocument.docket_number == docket_number
+    ).order_by(FLDocument.filed_date.desc().nullslast()).limit(50).all()
+
+    # Get events
+    events = db.query(FLCaseEvent).filter(
+        FLCaseEvent.docket_number == docket_number
+    ).order_by(FLCaseEvent.event_date.desc()).limit(100).all()
+
+    # Get selling windows
+    windows = db.query(FLSellingWindow).filter(
+        FLSellingWindow.docket_number == docket_number
+    ).order_by(FLSellingWindow.window_date).all()
+
+    # Get regulatory decision if exists
+    decision = db.query(FLRegulatoryDecision).filter(
+        FLRegulatoryDecision.docket_number == docket_number
+    ).first()
+
+    # Get linked hearings
+    hearing_links = db.query(FLHearingDocket).filter(
+        FLHearingDocket.docket_id == docket.id
+    ).all()
+
+    hearings = []
+    for link in hearing_links:
+        h = link.hearing
+        if h:
+            hearings.append({
+                "id": h.id,
+                "title": h.title,
+                "hearing_date": h.hearing_date.isoformat() if h.hearing_date else None,
+                "hearing_type": h.hearing_type,
+                "source_url": h.source_url,
+            })
+
+    return {
+        "docket": {
+            "docket_number": docket.docket_number,
+            "title": docket.title,
+            "utility": docket.utility_name,
+            "status": docket.status,
+            "case_type": docket.case_type,
+            "industry_type": docket.industry_type,
+            "sector": docket.sector_code,
+            "filed_date": docket.filed_date.isoformat() if docket.filed_date else None,
+            "closed_date": docket.closed_date.isoformat() if docket.closed_date else None,
+            "psc_url": docket.psc_url,
+            # Rate case outcome fields
+            "requested_revenue_increase": float(docket.requested_revenue_increase) if docket.requested_revenue_increase else None,
+            "approved_revenue_increase": float(docket.approved_revenue_increase) if docket.approved_revenue_increase else None,
+            "requested_roe": float(docket.requested_roe) if docket.requested_roe else None,
+            "approved_roe": float(docket.approved_roe) if docket.approved_roe else None,
+            "vote_result": docket.vote_result,
+            "final_order_number": docket.final_order_number,
+        },
+        "documents": [
+            {
+                "id": d.id,
+                "title": d.title,
+                "document_type": d.document_type,
+                "filed_date": d.filed_date.isoformat() if d.filed_date else None,
+                "filer_name": d.filer_name,
+                "file_url": d.file_url,
+            }
+            for d in documents
+        ],
+        "events": [
+            {
+                "id": e.id,
+                "event_date": e.event_date.isoformat() if e.event_date else None,
+                "event_type": e.event_type,
+                "who": e.who,
+                "what": e.what,
+                "why_it_matters": e.why_it_matters,
+                "source_type": e.source_type,
+                "source_id": e.source_id,
+            }
+            for e in events
+        ],
+        "hearings": hearings,
+        "selling_windows": [
+            {
+                "id": w.id,
+                "window_type": w.window_type,
+                "window_date": w.window_date.isoformat() if w.window_date else None,
+                "description": w.description,
+                "target_personas": w.target_personas,
+                "outreach_start_date": w.outreach_start_date.isoformat() if w.outreach_start_date else None,
+                "is_active": w.is_active,
+            }
+            for w in windows
+        ],
+        "decision": {
+            "id": decision.id,
+            "document_type": decision.document_type,
+            "order_number": decision.order_number,
+            "utility_name": decision.utility_name,
+            "case_type": decision.case_type,
+            "revenue_requested": float(decision.revenue_requested) if decision.revenue_requested else None,
+            "revenue_approved": float(decision.revenue_approved) if decision.revenue_approved else None,
+            "roe_requested": float(decision.roe_requested) if decision.roe_requested else None,
+            "roe_approved": float(decision.roe_approved) if decision.roe_approved else None,
+        } if decision else None,
+        "counts": {
+            "documents": len(documents),
+            "events": len(events),
+            "hearings": len(hearings),
+            "selling_windows": len(windows),
+        }
+    }
+
+
+@router.get("/cases/{docket_number}/events")
+def get_case_events(
+    docket_number: str,
+    event_type: Optional[str] = Query(None, description="Filter by event type"),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db)
+):
+    """
+    Get timeline events for a case.
+
+    Returns events in chronological order for the CaseTimeline component.
+    """
+    from florida.models.sales import FLCaseEvent
+
+    query = db.query(FLCaseEvent).filter(FLCaseEvent.docket_number == docket_number)
+
+    if event_type:
+        query = query.filter(FLCaseEvent.event_type == event_type)
+
+    total = query.count()
+    events = query.order_by(FLCaseEvent.event_date.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "docket_number": docket_number,
+        "total": total,
+        "events": [
+            {
+                "id": e.id,
+                "event_date": e.event_date.isoformat() if e.event_date else None,
+                "event_type": e.event_type,
+                "who": e.who,
+                "what": e.what,
+                "why_it_matters": e.why_it_matters,
+                "case_summary_after": e.case_summary_after,
+                "source_type": e.source_type,
+                "source_id": e.source_id,
+            }
+            for e in events
+        ]
+    }
+
+
+@router.get("/cases/{docket_number}/participants")
+def get_case_participants(
+    docket_number: str,
+    role: Optional[str] = Query(None, description="Filter by role: commissioner, counsel, witness"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get participants from all hearings linked to this case.
+
+    Aggregates participants from FLHearingParticipant across all linked hearings.
+    """
+    from florida.models.transcript import FLHearingParticipant
+
+    # Get docket
+    docket = db.query(FLDocket).filter(FLDocket.docket_number == docket_number).first()
+    if not docket:
+        raise HTTPException(status_code=404, detail=f"Docket {docket_number} not found")
+
+    # Get hearing IDs linked to this docket
+    hearing_links = db.query(FLHearingDocket).filter(FLHearingDocket.docket_id == docket.id).all()
+    hearing_ids = [link.hearing_id for link in hearing_links]
+
+    if not hearing_ids:
+        return {
+            "docket_number": docket_number,
+            "total": 0,
+            "participants": [],
+            "by_role": {}
+        }
+
+    # Get participants
+    query = db.query(FLHearingParticipant).filter(FLHearingParticipant.hearing_id.in_(hearing_ids))
+
+    if role:
+        query = query.filter(FLHearingParticipant.participant_role == role)
+
+    participants = query.all()
+
+    # Group by role
+    by_role = {}
+    seen_names = set()  # De-duplicate across hearings
+    unique_participants = []
+
+    for p in participants:
+        key = (p.participant_name, p.participant_role, p.representing_party)
+        if key not in seen_names:
+            seen_names.add(key)
+            unique_participants.append(p)
+            role_name = p.participant_role
+            if role_name not in by_role:
+                by_role[role_name] = []
+            by_role[role_name].append({
+                "name": p.participant_name,
+                "role": p.participant_role,
+                "representing_party": p.representing_party,
+                "organization": p.organization,
+                "turn_count": p.turn_count,
+                "word_count": p.word_count,
+            })
+
+    return {
+        "docket_number": docket_number,
+        "total": len(unique_participants),
+        "participants": [
+            {
+                "id": p.id,
+                "name": p.participant_name,
+                "role": p.participant_role,
+                "representing_party": p.representing_party,
+                "organization": p.organization,
+                "turn_count": p.turn_count,
+                "word_count": p.word_count,
+            }
+            for p in unique_participants
+        ],
+        "by_role": by_role
+    }
+
+
+@router.get("/cases/{docket_number}/financials")
+def get_case_financials(
+    docket_number: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get financial data for a rate case.
+
+    Includes requested vs approved amounts, ROE, and voting info.
+    """
+    from florida.models.regulatory_decision import FLRegulatoryDecision
+
+    # Get docket
+    docket = db.query(FLDocket).filter(FLDocket.docket_number == docket_number).first()
+    if not docket:
+        raise HTTPException(status_code=404, detail=f"Docket {docket_number} not found")
+
+    # Get decision if exists
+    decision = db.query(FLRegulatoryDecision).filter(
+        FLRegulatoryDecision.docket_number == docket_number
+    ).first()
+
+    # Check if this is a rate case (has financial data)
+    is_rate_case = any([
+        docket.requested_revenue_increase,
+        docket.approved_revenue_increase,
+        docket.requested_roe,
+        docket.approved_roe,
+        decision
+    ])
+
+    return {
+        "docket_number": docket_number,
+        "is_rate_case": is_rate_case,
+        "requested": {
+            "revenue_increase": float(docket.requested_revenue_increase) if docket.requested_revenue_increase else None,
+            "roe": float(docket.requested_roe) if docket.requested_roe else None,
+        },
+        "approved": {
+            "revenue_increase": float(docket.approved_revenue_increase) if docket.approved_revenue_increase else None,
+            "roe": float(docket.approved_roe) if docket.approved_roe else None,
+        },
+        "vote_result": docket.vote_result,
+        "final_order_number": docket.final_order_number,
+        "decision": {
+            "id": decision.id,
+            "decision_date": decision.decision_date.isoformat() if decision.decision_date else None,
+            "outcome": decision.outcome,
+            "revenue_approved": float(decision.revenue_approved) if decision.revenue_approved else None,
+            "roe_approved": float(decision.roe_approved) if decision.roe_approved else None,
+            "vote_result": decision.vote_result,
+            "order_number": decision.order_number,
+            "summary": decision.summary,
+        } if decision else None
+    }
+
+
+@router.get("/cases/{docket_number}/documents")
+def get_case_documents(
+    docket_number: str,
+    document_type: Optional[str] = Query(None, description="Filter by document type"),
+    filer: Optional[str] = Query(None, description="Filter by filer name"),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db)
+):
+    """
+    Get documents for a case with filtering.
+
+    Supports filtering by document type and filer.
+    """
+    from florida.models.document import FLDocument
+
+    query = db.query(FLDocument).filter(FLDocument.docket_number == docket_number)
+
+    if document_type:
+        query = query.filter(FLDocument.document_type.ilike(f'%{document_type}%'))
+
+    if filer:
+        query = query.filter(FLDocument.filer_name.ilike(f'%{filer}%'))
+
+    total = query.count()
+    documents = query.order_by(FLDocument.filed_date.desc().nullslast()).offset(offset).limit(limit).all()
+
+    # Get distinct document types for filter options
+    doc_types = db.query(FLDocument.document_type).filter(
+        FLDocument.docket_number == docket_number,
+        FLDocument.document_type.isnot(None)
+    ).distinct().all()
+
+    # Get distinct filers for filter options
+    filers = db.query(FLDocument.filer_name).filter(
+        FLDocument.docket_number == docket_number,
+        FLDocument.filer_name.isnot(None)
+    ).distinct().all()
+
+    return {
+        "docket_number": docket_number,
+        "total": total,
+        "documents": [
+            {
+                "id": d.id,
+                "title": d.title,
+                "document_type": d.document_type,
+                "filed_date": d.filed_date.isoformat() if d.filed_date else None,
+                "filer_name": d.filer_name,
+                "file_url": d.file_url,
+                "file_type": d.file_type,
+                "page_count": d.page_count,
+            }
+            for d in documents
+        ],
+        "filter_options": {
+            "document_types": [t[0] for t in doc_types if t[0]],
+            "filers": [f[0] for f in filers if f[0]],
         }
     }
