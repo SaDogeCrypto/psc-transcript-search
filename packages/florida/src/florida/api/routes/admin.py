@@ -1957,6 +1957,7 @@ def list_cases(
     This is the main endpoint for the Cases page in the sales dashboard.
     """
     from florida.models.document import FLDocument
+    from florida.models.hearing import FLHearing
     from florida.models.sales import FLCaseEvent, FLSellingWindow
 
     query = db.query(FLDocket)
@@ -2026,9 +2027,12 @@ def list_cases(
             )
         ).scalar() or 0
 
-        # Hearing count (via hearing_docket junction table)
-        hearing_count = db.query(func.count(FLHearingDocket.id)).filter(
-            FLHearingDocket.docket_id == d.id
+        # Hearing count - match on docket_number directly (also check base number)
+        hearing_count = db.query(func.count(FLHearing.id)).filter(
+            or_(
+                FLHearing.docket_number == d.docket_number,
+                FLHearing.docket_number == base_docket
+            )
         ).scalar() or 0
 
         # Event count - match on full docket number (events have proper format)
@@ -2110,22 +2114,24 @@ def get_case_detail(
         FLRegulatoryDecision.docket_number == docket_number
     ).first()
 
-    # Get linked hearings
-    hearing_links = db.query(FLHearingDocket).filter(
-        FLHearingDocket.docket_id == docket.id
-    ).all()
+    # Get hearings - match on docket_number directly (also check base number)
+    from florida.models.hearing import FLHearing
+    hearing_records = db.query(FLHearing).filter(
+        or_(
+            FLHearing.docket_number == docket_number,
+            FLHearing.docket_number == base_docket
+        )
+    ).order_by(FLHearing.hearing_date.desc()).all()
 
     hearings = []
-    for link in hearing_links:
-        h = link.hearing
-        if h:
-            hearings.append({
-                "id": h.id,
-                "title": h.title,
-                "hearing_date": h.hearing_date.isoformat() if h.hearing_date else None,
-                "hearing_type": h.hearing_type,
-                "source_url": h.source_url,
-            })
+    for h in hearing_records:
+        hearings.append({
+            "id": h.id,
+            "title": h.title,
+            "hearing_date": h.hearing_date.isoformat() if h.hearing_date else None,
+            "hearing_type": h.hearing_type,
+            "source_url": h.source_url,
+        })
 
     return {
         "docket": {
