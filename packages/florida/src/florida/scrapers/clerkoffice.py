@@ -254,18 +254,31 @@ class FloridaClerkOfficeScraper(BaseDocketScraper):
     def _parse_api_result(self, item: Dict[str, Any]) -> Optional[FloridaDocketData]:
         """Parse an API result into a FloridaDocketData object."""
         try:
-            docket_number = item.get('docketnum') or str(item.get('docketId', ''))
-            if not docket_number:
+            base_docket = item.get('docketnum') or str(item.get('docketId', ''))
+            if not base_docket:
                 return None
+
+            # Get sector code from documentType field (e.g., "EU", "EI", "GU")
+            sector_code = item.get('documentType')
+
+            # Construct full docket number: YYYYNNNN-XX
+            # API returns docketnum without suffix, documentType has the sector code
+            if sector_code and '-' not in base_docket:
+                docket_number = f"{base_docket}-{sector_code}"
+            else:
+                docket_number = base_docket
 
             # Parse docket number components
             components = self.parse_docket_number(docket_number)
             if not components:
-                # Try to extract year from filing date
-                filed_date = self._parse_date(item.get('docketedDate'))
-                year = filed_date.year if filed_date else datetime.now().year
-                sequence = 0
-                sector_code = None
+                # Try to extract year and sequence from base docket
+                if len(base_docket) >= 8 and base_docket[:8].isdigit():
+                    year = int(base_docket[:4])
+                    sequence = int(base_docket[4:8])
+                else:
+                    filed_date = self._parse_date(item.get('docketedDate'))
+                    year = filed_date.year if filed_date else datetime.now().year
+                    sequence = 0
             else:
                 year = components['year']
                 sequence = components['sequence']
