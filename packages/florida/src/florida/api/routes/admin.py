@@ -2014,9 +2014,16 @@ def list_cases(
     # Enrich with counts
     results = []
     for d in dockets:
-        # Document count
+        # Extract base docket number (first 8 digits) for matching documents
+        # Documents often don't have the sector suffix (e.g., "20250011" not "20250011-EI")
+        base_docket = d.docket_number.split('-')[0] if d.docket_number else None
+
+        # Document count - match on base docket number OR full docket number
         doc_count = db.query(func.count(FLDocument.id)).filter(
-            FLDocument.docket_number == d.docket_number
+            or_(
+                FLDocument.docket_number == d.docket_number,
+                FLDocument.docket_number == base_docket
+            )
         ).scalar() or 0
 
         # Hearing count (via hearing_docket junction table)
@@ -2024,7 +2031,7 @@ def list_cases(
             FLHearingDocket.docket_id == d.id
         ).scalar() or 0
 
-        # Event count
+        # Event count - match on full docket number (events have proper format)
         event_count = db.query(func.count(FLCaseEvent.id)).filter(
             FLCaseEvent.docket_number == d.docket_number
         ).scalar() or 0
@@ -2065,6 +2072,7 @@ def get_case_detail(
     """
     Get detailed case information including timeline, documents, hearings.
     """
+    from sqlalchemy import or_
     from florida.models.document import FLDocument
     from florida.models.sales import FLCaseEvent, FLSellingWindow
     from florida.models.regulatory_decision import FLRegulatoryDecision
@@ -2077,9 +2085,14 @@ def get_case_detail(
     if not docket:
         raise HTTPException(status_code=404, detail=f"Docket {docket_number} not found")
 
-    # Get documents
+    # Get documents - match on base docket number OR full docket number
+    # Documents often don't have the sector suffix (e.g., "20250011" not "20250011-EI")
+    base_docket = docket_number.split('-')[0] if docket_number else None
     documents = db.query(FLDocument).filter(
-        FLDocument.docket_number == docket_number
+        or_(
+            FLDocument.docket_number == docket_number,
+            FLDocument.docket_number == base_docket
+        )
     ).order_by(FLDocument.filed_date.desc().nullslast()).limit(50).all()
 
     # Get events
